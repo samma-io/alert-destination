@@ -1,0 +1,52 @@
+# Which destinations each alert reaches.
+#
+# This is the table embedded in the binary. It is a placeholder: the channel and
+# repository below do not exist, and a deployment replaces the whole table with
+# ALERTDEST_ROUTES_PARAM (an SSM parameter holding this YAML) or
+# ALERTDEST_ROUTES_PATH (a file). Whichever source is configured is validated
+# at start and a broken one stops the function from starting; there is no
+# fall-through to this file, so a deployment never routes with a table its
+# operator did not choose.
+#
+# Matching is most-specific-wins: an exact (level, log_source) beats an exact
+# level with a wildcard source, which beats a wildcard level with an exact
+# source, which beats the all-wildcard rule. Wildcards are always written "*" --
+# never implied by leaving a field out -- so that a rule's breadth is visible
+# without knowing the matcher's rules.
+#
+# Every route must include slack. GitHub failing while Slack succeeded is
+# survivable because a human sees the Slack message; the reverse is not, because
+# nobody watches an issue tracker in real time. Load() enforces this.
+
+routes:
+  # GitHub gets critical only, deliberately. Alert ids are per matched *record*,
+  # so a rule firing on 500 records in one object is 500 issues. Until a
+  # per-rule suppression window exists, widening this is how you get 400 issues
+  # on a Tuesday.
+  # The repository's label set is a prerequisite, not a detail: GitHub answers
+  # 422 for an unknown label and this service reads that as permanent, so an
+  # alert routed here for a level or source whose label is missing is never
+  # delivered. The renderer applies `detection`, `severity:<level>` and
+  # `source:<log_source>`.
+  - level: critical
+    log_source: "*"
+    deliveries:
+      - {to: slack, target: "C0EXAMPLE1"}
+      - {to: github, target: "example-org/security-alerts"}
+
+  - level: high
+    log_source: "*"
+    deliveries:
+      - {to: slack, target: "C0EXAMPLE1"}
+
+  - level: "*"
+    log_source: "*"
+    deliveries:
+      - {to: slack, target: "C0EXAMPLE1"}
+
+# Unreachable while an all-wildcard route exists, and mandatory anyway: it is
+# what makes "no route matched" impossible by construction rather than by
+# inspection.
+default:
+  deliveries:
+    - {to: slack, target: "C0EXAMPLE1"}

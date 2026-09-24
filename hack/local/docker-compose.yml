@@ -1,0 +1,19 @@
+# Local dependencies for the integration suite.
+#
+# DynamoDB only: SQS redelivery and the dead-letter queue are AWS behaviour we
+# configure rather than code we wrote, and the destinations are exercised with
+# httptest servers inside the test. What a fake cannot prove, and what this is
+# here for, is that the conditional write really maps to
+# ConditionalCheckFailedException and that the attempt counter really
+# accumulates.
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.2
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8000 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 15

@@ -1,0 +1,22 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan*
+*.tfvars
+!*.tfvars.example
+.env
+.env.*
+crash.log
+override.tf
+*_override.tf
+.terraform.lock.hcl
+.DS_Store
+
+# Go build outputs
+/bin/
+/dist/
+*.zip
+*.zip.sha256
+*.test
+*.out

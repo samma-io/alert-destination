@@ -1,0 +1,13 @@
+alert-destination
+Copyright 2026 samma.io contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project is part of samma-io/aws-siem. It is distributed as a Lambda
+deployment package (a zip published as a GitHub Release asset) and links the
+following third-party Go modules, which keep their own licences:
+
+  github.com/aws/aws-lambda-go                Apache-2.0
+  github.com/aws/aws-sdk-go-v2 (and submodules) Apache-2.0
+  github.com/aws/smithy-go                    Apache-2.0
+  gopkg.in/yaml.v3                            MIT and Apache-2.0
