@@ -23,9 +23,48 @@ import (
 // Target is the channel id or "owner/repo" the route chose. It is a parameter
 // rather than client state because there is one client per destination type and
 // the address is a routing decision.
+//
+// On success Deliver returns the Ref the destination assigned, which the ledger
+// stores on the delivered row.
 type Destination interface {
 	Name() string
-	Deliver(ctx context.Context, a alert.Alert, target string) error
+	Deliver(ctx context.Context, a alert.Alert, target string) (Ref, error)
+}
+
+// Ref is whatever identifies a delivery at the destination: an issue number and
+// url, a Slack channel and ts. It is what makes "which issue is this alert" a
+// ledger lookup instead of a search over there. Nil is valid; a destination that
+// answered without one still delivered.
+type Ref map[string]string
+
+// detailError carries the destination's own reason code and HTTP status, so the
+// ledger's failure row can say "channel_not_found" or "422" rather than only a
+// sentence.
+type detailError struct {
+	err    error
+	code   string
+	status int
+}
+
+func (e detailError) Error() string { return e.err.Error() }
+func (e detailError) Unwrap() error { return e.err }
+
+// WithDetail attaches a reason code and an HTTP status to err. Either may be
+// zero. Wrap it inside Permanent or AuthFailure, not outside: Detail finds it
+// either way, but the classification is what callers test first.
+func WithDetail(err error, code string, status int) error {
+	return detailError{err: err, code: code, status: status}
+}
+
+// Detail returns the reason code and HTTP status attached anywhere in err's
+// chain, or zero values when there are none -- a transport error never reached
+// the destination, so it has neither.
+func Detail(err error) (code string, status int) {
+	var d detailError
+	if errors.As(err, &d) {
+		return d.code, d.status
+	}
+	return "", 0
 }
 
 // permanentError marks a failure no retry can fix.

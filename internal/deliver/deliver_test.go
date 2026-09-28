@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/samma-io/alert-destination/internal/alert"
+	"github.com/samma-io/alert-destination/internal/archive"
 	"github.com/samma-io/alert-destination/internal/deliver"
 	"github.com/samma-io/alert-destination/internal/destination"
 	"github.com/samma-io/alert-destination/internal/ledger"
@@ -21,13 +22,17 @@ import (
 type recorder struct {
 	name  string
 	calls []string // "target" per Deliver
+	ref   destination.Ref
 	err   error
 }
 
 func (r *recorder) Name() string { return r.name }
-func (r *recorder) Deliver(_ context.Context, _ alert.Alert, target string) error {
+func (r *recorder) Deliver(_ context.Context, _ alert.Alert, target string) (destination.Ref, error) {
 	r.calls = append(r.calls, target)
-	return r.err
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.ref, nil
 }
 
 type memStore struct {
@@ -173,9 +178,9 @@ type orderedRecorder struct {
 }
 
 func (o *orderedRecorder) Name() string { return o.name }
-func (o *orderedRecorder) Deliver(context.Context, alert.Alert, string) error {
+func (o *orderedRecorder) Deliver(context.Context, alert.Alert, string) (destination.Ref, error) {
 	*o.seq.order = append(*o.seq.order, o.name)
-	return nil
+	return nil, nil
 }
 
 func TestHandle_RoutesByLevel(t *testing.T) {
@@ -398,5 +403,171 @@ func TestHandle_UnknownDestinationInTheTableIsAnError(t *testing.T) {
 
 	if _, err := r.handler.Handle(context.Background(), testAlert("critical")); err == nil {
 		t.Fatal("Handle succeeded with an unregistered destination in the route")
+	}
+}
+
+// --- ref and failure detail ------------------------------------------------
+
+// The destination's own reference is what turns "which issue is this alert"
+// into a ledger lookup.
+func TestHandle_RecordsTheRefOnTheDeliveredRow(t *testing.T) {
+	r := newRig(t)
+	r.github.ref = destination.Ref{"number": "412", "html_url": "https://github.invalid/o/r/issues/412"}
+
+	if _, err := r.handler.Handle(context.Background(), testAlert("critical")); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	k := ledger.Key{AlertID: "det_1", Destination: "github", Target: "example-org/detections"}
+	row := r.store.rows[k.PK()+k.SK()]
+	if row.Ref["number"] != "412" || row.Ref["html_url"] == "" {
+		t.Errorf("Ref = %v, want the issue number and url", row.Ref)
+	}
+}
+
+func TestHandle_RecordsTheCodeAndStatusOfAFailure(t *testing.T) {
+	r := newRig(t)
+	r.github.err = destination.Permanent(
+		destination.WithDetail(errors.New("422 Validation Failed"), "unprocessable_entity", 422))
+
+	r.handler.Handle(context.Background(), testAlert("critical"))
+
+	k := ledger.Key{AlertID: "det_1", Destination: "github", Target: "example-org/detections"}
+	row := r.store.rows[k.PK()+k.SK()]
+	if row.Code != "unprocessable_entity" || row.HTTPStatus != 422 {
+		t.Errorf("failure row Code=%q HTTPStatus=%d, want unprocessable_entity/422", row.Code, row.HTTPStatus)
+	}
+}
+
+func TestHandle_AnAbandonedDeliveryIsCoded(t *testing.T) {
+	r := newRig(t)
+	r.handler.Reserve = time.Hour
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
+	defer cancel()
+
+	r.handler.Handle(ctx, testAlert("low"))
+
+	k := ledger.Key{AlertID: "det_1", Destination: "slack", Target: "C0ALL"}
+	if row := r.store.rows[k.PK()+k.SK()]; row.Code != "abandoned" {
+		t.Errorf("Code = %q, want abandoned", row.Code)
+	}
+}
+
+// --- archive ---------------------------------------------------------------
+
+type objectStore struct {
+	keys []string
+	err  error
+	// before records what had been delivered when Put was called.
+	before int
+	seen   *recorder
+}
+
+func (o *objectStore) Put(_ context.Context, key string, _ []byte) error {
+	if o.seen != nil {
+		o.before = len(o.seen.calls)
+	}
+	if o.err != nil {
+		return o.err
+	}
+	o.keys = append(o.keys, key)
+	return nil
+}
+
+func withArchive(r *rig, st *objectStore) {
+	r.handler.Archive = &archive.Archive{Store: st, Bucket: "detections-123456789012"}
+}
+
+func TestHandle_ArchivesBeforeAnyDelivery(t *testing.T) {
+	r := newRig(t)
+	st := &objectStore{seen: r.slack}
+	withArchive(r, st)
+
+	res, err := r.handler.Handle(context.Background(), testAlert("critical"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(st.keys) != 1 {
+		t.Fatalf("archive writes = %d, want 1", len(st.keys))
+	}
+	if st.before != 0 {
+		t.Error("slack was notified before the alert was archived")
+	}
+	if res.Archive != deliver.ArchiveWritten {
+		t.Errorf("Archive = %q, want written", res.Archive)
+	}
+
+	k := ledger.Key{AlertID: "det_1", Destination: archive.Destination, Target: "detections-123456789012"}
+	row := r.store.rows[k.PK()+k.SK()]
+	if row.Status != ledger.StatusDelivered || row.Ref["key"] != st.keys[0] {
+		t.Errorf("archive ledger row = %+v, want delivered with the object key", row)
+	}
+}
+
+// The ledger is what makes a replay skip the archive, as it skips a destination.
+func TestHandle_AReplaySkipsTheArchive(t *testing.T) {
+	r := newRig(t)
+	st := &objectStore{}
+	withArchive(r, st)
+
+	r.handler.Handle(context.Background(), testAlert("critical"))
+	res, err := r.handler.Handle(context.Background(), testAlert("critical"))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(st.keys) != 1 {
+		t.Errorf("archive writes = %d across a replay, want 1", len(st.keys))
+	}
+	if res.Archive != deliver.ArchiveSkipped {
+		t.Errorf("Archive = %q, want skipped", res.Archive)
+	}
+}
+
+// Like an unreadable ledger: fail, notify nobody, and let SQS bring it back.
+func TestHandle_AFailedArchiveWriteFailsBeforeAnyDelivery(t *testing.T) {
+	r := newRig(t)
+	withArchive(r, &objectStore{err: errors.New("AccessDenied")})
+
+	res, err := r.handler.Handle(context.Background(), testAlert("critical"))
+	if err == nil {
+		t.Fatal("Handle succeeded although the alert was not archived")
+	}
+	if len(r.slack.calls)+len(r.github.calls) != 0 {
+		t.Error("a destination was notified although the archive write failed")
+	}
+	if res.Archive != deliver.ArchiveFailed {
+		t.Errorf("Archive = %q, want failed", res.Archive)
+	}
+
+	k := ledger.Key{AlertID: "det_1", Destination: archive.Destination, Target: "detections-123456789012"}
+	if row := r.store.rows[k.PK()+k.SK()]; row.Status != ledger.StatusFailed {
+		t.Errorf("archive failure row status = %q, want failed", row.Status)
+	}
+}
+
+// A failed-archive row is forensics like any other failure: the next receive
+// must try again.
+func TestHandle_AFailedArchiveIsRetriedOnTheNextReceive(t *testing.T) {
+	r := newRig(t)
+	st := &objectStore{err: errors.New("SlowDown")}
+	withArchive(r, st)
+
+	r.handler.Handle(context.Background(), testAlert("low"))
+	st.err = nil
+	if _, err := r.handler.Handle(context.Background(), testAlert("low")); err != nil {
+		t.Fatalf("second receive: %v", err)
+	}
+	if len(st.keys) != 1 || len(r.slack.calls) != 1 {
+		t.Errorf("archive writes=%d slack=%d, want 1 and 1", len(st.keys), len(r.slack.calls))
+	}
+}
+
+func TestHandle_ArchiveOffByDefault(t *testing.T) {
+	r := newRig(t)
+	res, err := r.handler.Handle(context.Background(), testAlert("low"))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if res.Archive != deliver.ArchiveOff {
+		t.Errorf("Archive = %q with no archive configured", res.Archive)
 	}
 }

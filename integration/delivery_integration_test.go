@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/samma-io/alert-destination/internal/alert"
+	"github.com/samma-io/alert-destination/internal/archive"
 	"github.com/samma-io/alert-destination/internal/deliver"
 	"github.com/samma-io/alert-destination/internal/destination"
 	"github.com/samma-io/alert-destination/internal/destination/github"
@@ -156,6 +157,8 @@ func TestDeliveryContract_PartialFailureAcrossEveryRedeliveryUntilTheDLQ(t *test
 
 	if got := byDestination["slack"]; got.Status != ledger.StatusDelivered {
 		t.Errorf("slack row status = %q, want delivered", got.Status)
+	} else if got.Ref["ts"] != "1700000000.000100" {
+		t.Errorf("slack row ref = %v, want the ts Slack answered with", got.Ref)
 	}
 
 	failed := byDestination["github"]
@@ -170,6 +173,75 @@ func TestDeliveryContract_PartialFailureAcrossEveryRedeliveryUntilTheDLQ(t *test
 	}
 	if !strings.Contains(failed.Message, "Validation Failed") {
 		t.Errorf("the reason did not reach the ledger: %q", failed.Message)
+	}
+	if failed.Code != "unprocessable_entity" || failed.HTTPStatus != 422 {
+		t.Errorf("github failure code/status = %q/%d, want unprocessable_entity/422",
+			failed.Code, failed.HTTPStatus)
+	}
+}
+
+// The issue's number and url survive the round trip through DynamoDB, so
+// "which issue is this alert" is answered by the ledger.
+func TestDeliveryContract_TheLedgerRecordsTheIssue(t *testing.T) {
+	sl, gh := newFakeSlack(t), newFakeGitHub(t)
+	h := newHandler(t, sl, gh)
+	ctx := context.Background()
+
+	if _, err := h.Handle(ctx, criticalAlert()); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	rows, err := h.Ledger.Store.Query(ctx, ledger.Key{AlertID: "det_e2e"}.PK())
+	if err != nil {
+		t.Fatalf("reading the ledger: %v", err)
+	}
+	for _, r := range rows {
+		if r.Destination == "github" {
+			if r.Ref["number"] != "412" || r.Ref["html_url"] != "https://github.invalid/o/r/issues/412" {
+				t.Errorf("github ref = %v", r.Ref)
+			}
+			return
+		}
+	}
+	t.Error("no github row")
+}
+
+type memObjects struct{ puts map[string]int }
+
+func (m *memObjects) Put(_ context.Context, key string, _ []byte) error {
+	m.puts[key]++
+	return nil
+}
+
+// The archive is written once and recorded in the real ledger, so a redelivery
+// -- here, after GitHub failed the first receive -- skips it like a delivered
+// destination.
+func TestDeliveryContract_ArchiveIsWrittenOnceAcrossRedeliveries(t *testing.T) {
+	sl, gh := newFakeSlack(t), newFakeGitHub(t)
+	gh.rejectWith, gh.rejectBody = http.StatusServiceUnavailable, `{"message":"unavailable"}`
+	h := newHandler(t, sl, gh)
+	objects := &memObjects{puts: map[string]int{}}
+	h.Archive = &archive.Archive{Store: objects, Bucket: "detections-123456789012"}
+	ctx := context.Background()
+
+	if _, err := h.Handle(ctx, criticalAlert()); err == nil {
+		t.Fatal("the first receive succeeded despite GitHub being down")
+	}
+	gh.rejectWith = 0
+	res, err := h.Handle(ctx, criticalAlert())
+	if err != nil {
+		t.Fatalf("the redelivery failed: %v", err)
+	}
+
+	if len(objects.puts) != 1 {
+		t.Fatalf("archive keys = %v, want one", objects.puts)
+	}
+	for key, n := range objects.puts {
+		if n != 1 {
+			t.Errorf("%s written %d times, want 1", key, n)
+		}
+	}
+	if res.Archive != deliver.ArchiveSkipped {
+		t.Errorf("redelivery archive outcome = %q, want skipped", res.Archive)
 	}
 }
 

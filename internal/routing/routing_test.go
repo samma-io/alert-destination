@@ -100,6 +100,14 @@ func TestResolve_UnknownLogSourceIsFlaggedButStillDelivered(t *testing.T) {
 	}
 }
 
+// The cloudflare lane is a real lane, so its alerts must not be counted as
+// coming from somewhere unknown.
+func TestResolve_CloudflareIsAKnownLogSource(t *testing.T) {
+	if _, m := load(t, valid).Resolve("high", "cloudflare"); m.UnknownLogSource {
+		t.Error("cloudflare alerts are flagged as an unknown log source")
+	}
+}
+
 // Every (level, log_source) pair, known or not, must resolve to at least one
 // delivery. This is the guard against the whole silent-drop bug class.
 func TestResolve_IsTotal(t *testing.T) {

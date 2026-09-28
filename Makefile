@@ -3,8 +3,17 @@
 BINARY   := bootstrap
 PKG      := ./cmd/alert-destination
 MODULE   := github.com/samma-io/alert-destination
-VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-ARTIFACT := alert-destination-$(VERSION)
+
+# The image is built and pushed by us, not by a release workflow. The tag is
+# whatever the builder passes; the recommended value, and the default, is the
+# short git sha. aws-siem/hack/build-images.sh runs
+# `make image push IMAGE=... TAG=...` here and then extracts the Lambda zip.
+IMAGE    ?= ghcr.io/samma-io/alert-destination
+TAG      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+# Every Lambda and ECS task in aws-siem is x86_64.
+PLATFORM ?= linux/amd64
+# The version baked into the binary (and the GitHub User-Agent) is the tag.
+VERSION  ?= $(TAG)
 
 GO_IMAGE   ?= golang:1.25
 LINT_IMAGE ?= golangci/golangci-lint:v2.4.0
@@ -13,7 +22,9 @@ DOCKER_GO  := docker run --rm -v "$(CURDIR)":/w -w /w -v alert-destination-gomod
 GO         := $(DOCKER_GO) -e CGO_ENABLED=0 $(GO_IMAGE) go
 # The race detector needs cgo.
 GO_RACE    := $(DOCKER_GO) -e CGO_ENABLED=1 $(GO_IMAGE) go
-GO_LINUX   := $(DOCKER_GO) -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 $(GO_IMAGE) go
+# No VCS stamp: git inside the container refuses a checkout owned by another
+# uid, and the image (built without .git) carries none either.
+GO_LINUX   := $(DOCKER_GO) -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 -e GOFLAGS=-buildvcs=false $(GO_IMAGE) go
 
 LDFLAGS := -s -w -X $(MODULE)/internal/version.Version=$(VERSION)
 SHA256  := $(shell command -v sha256sum 2>/dev/null || echo "shasum -a 256")
@@ -62,15 +73,38 @@ tidy:
 build:
 	$(GO_LINUX) build -trimpath -ldflags='$(LDFLAGS)' -o bin/$(BINARY) $(PKG)
 
-# The same artifact the release workflow publishes: the zip and its sha256, in
-# the `sha256sum` format the aws-siem Terraform verifies before deploying.
-.PHONY: package
-package: build
+# The image: a static binary at /app/bootstrap on distroless/static. It runs as
+# a daemon when started outside Lambda (see "Running outside Lambda" in the
+# README) and is also where the Lambda zip comes from.
+.PHONY: image
+image:
+	docker build --platform $(PLATFORM) --build-arg VERSION=$(VERSION) -t $(IMAGE):$(TAG) .
+
+.PHONY: push
+push:
+	docker push $(IMAGE):$(TAG)
+
+# The Lambda deployment package: /app/bootstrap copied out of the image and
+# zipped as a single file named bootstrap at the root, which is what
+# provided.al2023 runs. Built from the image rather than from `make build` so
+# the zip and the image can never be two different binaries. The timestamp is
+# pinned so the same binary always gives the same zip, and so the same
+# source_code_hash in Terraform.
+.PHONY: lambda-zip
+lambda-zip: image
 	mkdir -p dist
-	rm -f dist/$(ARTIFACT).zip dist/$(ARTIFACT).zip.sha256
-	cd bin && zip -q -X ../dist/$(ARTIFACT).zip $(BINARY)
-	cd dist && $(SHA256) $(ARTIFACT).zip > $(ARTIFACT).zip.sha256
-	@cat dist/$(ARTIFACT).zip.sha256
+	rm -f dist/alert-destination.zip dist/$(BINARY)
+	cid=$$(docker create --platform $(PLATFORM) $(IMAGE):$(TAG)) && \
+	  docker cp "$$cid:/app/bootstrap" dist/$(BINARY); \
+	  status=$$?; docker rm "$$cid" >/dev/null 2>&1; exit $$status
+	chmod 0755 dist/$(BINARY)
+	touch -d '1980-01-01T00:00:00' dist/$(BINARY)
+	cd dist && zip -q -X alert-destination.zip $(BINARY) && rm $(BINARY)
+	@cd dist && $(SHA256) alert-destination.zip
+
+# Kept for muscle memory; the release asset it used to mirror no longer exists.
+.PHONY: package
+package: lambda-zip
 
 .PHONY: clean
 clean:
@@ -118,6 +152,6 @@ smoke:
 scrub:
 	./hack/scrub-check.sh .
 
-# Everything CI runs, in one command.
+# Everything CI runs, in one command (CI also builds the image and scans it).
 .PHONY: check
 check: fmt-check vet test-race scrub

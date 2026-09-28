@@ -1,4 +1,4 @@
-// Package config loads the Lambda's wiring from the environment.
+// Package config loads the service's wiring from the environment.
 //
 // Everything here is something that differs between a deployment, a local run
 // and a test. The routing table itself is not configured here, only where it is
@@ -19,6 +19,18 @@ import (
 // that, when time runs out, there is room to record why.
 const DefaultSoftDeadline = 5 * time.Second
 
+// Daemon defaults, used only outside Lambda.
+const (
+	// DefaultDaemonBatch is one message per receive, the same as the event
+	// source mapping's batch_size.
+	DefaultDaemonBatch = 1
+	// MaxDaemonBatch is SQS's own ceiling on MaxNumberOfMessages.
+	MaxDaemonBatch = 10
+	// DefaultDaemonMessageTimeout is the per-message budget, matching the
+	// Lambda's 60s timeout so the soft deadline behaves the same in both.
+	DefaultDaemonMessageTimeout = 60 * time.Second
+)
+
 // Config is the resolved environment.
 type Config struct {
 	// LedgerTable is the DynamoDB table recording what has been delivered.
@@ -37,12 +49,27 @@ type Config struct {
 	RoutesParam string
 	RoutesPath  string
 
+	// ArchiveBucket, when set, is the S3 bucket every alert is written to
+	// before any delivery. Empty turns archiving off.
+	ArchiveBucket string
+
 	SoftDeadline time.Duration
 	LogLevel     slog.Leveler
+
+	// QueueURL is the SQS queue to long-poll when not running in Lambda. In
+	// Lambda the event source mapping does the polling and this is ignored.
+	QueueURL string
+	// DaemonBatch is how many messages one receive asks for (1-10).
+	DaemonBatch int
+	// DaemonMessageTimeout is the per-message deadline in daemon mode, the
+	// equivalent of the Lambda timeout. It must exceed SoftDeadline.
+	DaemonMessageTimeout time.Duration
 
 	// Endpoint overrides. Localstack and tests only; empty in the account.
 	DynamoDBEndpointURL string
 	SSMEndpointURL      string
+	S3EndpointURL       string
+	SQSEndpointURL      string
 	SlackBaseURL        string
 	GitHubBaseURL       string
 }
@@ -65,9 +92,13 @@ func FromEnv(getenv func(string) string) (Config, error) {
 		GitHubTokenParam: get("ALERTDEST_GITHUB_TOKEN_PARAM"),
 		RoutesParam:      get("ALERTDEST_ROUTES_PARAM"),
 		RoutesPath:       get("ALERTDEST_ROUTES_PATH"),
+		ArchiveBucket:    get("ALERTDEST_ARCHIVE_BUCKET"),
+		QueueURL:         get("ALERTDEST_QUEUE_URL"),
 
 		DynamoDBEndpointURL: get("ALERTDEST_DYNAMODB_ENDPOINT_URL"),
 		SSMEndpointURL:      get("ALERTDEST_SSM_ENDPOINT_URL"),
+		S3EndpointURL:       get("ALERTDEST_S3_ENDPOINT_URL"),
+		SQSEndpointURL:      get("ALERTDEST_SQS_ENDPOINT_URL"),
 		SlackBaseURL:        get("ALERTDEST_SLACK_BASE_URL"),
 		GitHubBaseURL:       get("ALERTDEST_GITHUB_BASE_URL"),
 
@@ -97,6 +128,28 @@ func FromEnv(getenv func(string) string) (Config, error) {
 		cfg.SoftDeadline = deadline
 	}
 
+	batch, err := count(get("ALERTDEST_DAEMON_BATCH"), DefaultDaemonBatch)
+	switch {
+	case err != nil:
+		problems = append(problems, "ALERTDEST_DAEMON_BATCH: "+err.Error())
+	case batch < 1 || batch > MaxDaemonBatch:
+		problems = append(problems, fmt.Sprintf("ALERTDEST_DAEMON_BATCH must be between 1 and %d", MaxDaemonBatch))
+	default:
+		cfg.DaemonBatch = batch
+	}
+
+	timeout, err := goDuration(get("ALERTDEST_DAEMON_MESSAGE_TIMEOUT"), DefaultDaemonMessageTimeout)
+	switch {
+	case err != nil:
+		problems = append(problems, "ALERTDEST_DAEMON_MESSAGE_TIMEOUT: "+err.Error())
+	case cfg.SoftDeadline > 0 && timeout <= cfg.SoftDeadline:
+		// Otherwise every delivery is abandoned before it starts.
+		problems = append(problems, fmt.Sprintf(
+			"ALERTDEST_DAEMON_MESSAGE_TIMEOUT (%s) must exceed the soft deadline (%s)", timeout, cfg.SoftDeadline))
+	default:
+		cfg.DaemonMessageTimeout = timeout
+	}
+
 	if len(problems) > 0 {
 		return Config{}, errors.New("invalid configuration:\n  " + strings.Join(problems, "\n  "))
 	}
@@ -112,6 +165,36 @@ func duration(raw string, fallback time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%q is not a whole number of seconds", raw)
 	}
 	return time.Duration(secs) * time.Second, nil
+}
+
+func count(raw string, fallback int) (int, error) {
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a whole number", raw)
+	}
+	return n, nil
+}
+
+// goDuration reads a Go duration ("60s", "2m"), or a bare number as seconds so
+// the value can be written the same way as ALERTDEST_SOFT_DEADLINE_SECONDS.
+func goDuration(raw string, fallback time.Duration) (time.Duration, error) {
+	if raw == "" {
+		return fallback, nil
+	}
+	if secs, err := strconv.Atoi(raw); err == nil {
+		raw = strconv.Itoa(secs) + "s"
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a duration such as 60s", raw)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%q must be positive", raw)
+	}
+	return d, nil
 }
 
 func parseLevel(raw string) slog.Leveler {

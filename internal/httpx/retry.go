@@ -4,7 +4,7 @@
 // task can treat an advertised wait as a floor with no ceiling; a Lambda cannot.
 // GitHub's secondary-rate-limit Retry-After is routinely 60s, and honouring that
 // inside a 60s Lambda spends the whole budget asleep and ends in "Task timed
-// out" with no structured log and nothing written to the ledger. SQS's 120s
+// out" with no structured log and nothing written to the ledger. SQS's visibility-timeout
 // redelivery is the long backoff; this transport's job is to give up fast and
 // let the message come back.
 package httpx

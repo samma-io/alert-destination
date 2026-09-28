@@ -109,7 +109,7 @@ func TestRoundTrip_ResendsTheRequestBodyOnEveryAttempt(t *testing.T) {
 
 // GitHub's secondary-rate-limit Retry-After is routinely 60s. Honouring it
 // inside a 60s Lambda sleeps through the whole budget and the invocation dies
-// with "Task timed out" and no structured log. SQS's 120s redelivery is the
+// with "Task timed out" and no structured log. SQS's visibility-timeout redelivery is the
 // long backoff; this transport's job is to give up quickly.
 func TestRoundTrip_DoesNotSleepPastTheCeiling(t *testing.T) {
 	var attempts int

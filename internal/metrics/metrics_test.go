@@ -84,6 +84,8 @@ func TestEveryDeclaredMetricHasAnIncrementSite(t *testing.T) {
 		b.UnknownLevel()
 		b.UnknownLogSource()
 		b.UsedDefaultRoute()
+		b.Archive(false)
+		b.Archive(true)
 	})
 
 	for _, name := range metrics.Names() {

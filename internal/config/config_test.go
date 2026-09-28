@@ -199,3 +199,80 @@ func TestFromEnv_RoutesSourcesAreRead(t *testing.T) {
 		t.Errorf("RoutesPath = %q", cfg.RoutesPath)
 	}
 }
+
+func TestFromEnv_ArchiveIsOffUnlessABucketIsSet(t *testing.T) {
+	cfg, err := config.FromEnv(env(complete()))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.ArchiveBucket != "" {
+		t.Errorf("ArchiveBucket = %q, want empty", cfg.ArchiveBucket)
+	}
+
+	vars := complete()
+	vars["ALERTDEST_ARCHIVE_BUCKET"] = "siem-detections-123456789012"
+	if cfg, _ = config.FromEnv(env(vars)); cfg.ArchiveBucket != "siem-detections-123456789012" {
+		t.Errorf("ArchiveBucket = %q", cfg.ArchiveBucket)
+	}
+}
+
+func TestFromEnv_DaemonDefaults(t *testing.T) {
+	cfg, err := config.FromEnv(env(complete()))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.QueueURL != "" || cfg.DaemonBatch != 1 || cfg.DaemonMessageTimeout != 60*time.Second {
+		t.Errorf("daemon defaults = %q/%d/%s, want empty/1/60s",
+			cfg.QueueURL, cfg.DaemonBatch, cfg.DaemonMessageTimeout)
+	}
+}
+
+func TestFromEnv_DaemonSettingsAreRead(t *testing.T) {
+	vars := complete()
+	vars["ALERTDEST_QUEUE_URL"] = "https://sqs.us-east-1.amazonaws.com/123456789012/alerts"
+	vars["ALERTDEST_SQS_ENDPOINT_URL"] = "http://localhost:4566"
+	vars["ALERTDEST_DAEMON_BATCH"] = "10"
+	vars["ALERTDEST_DAEMON_MESSAGE_TIMEOUT"] = "2m"
+
+	cfg, err := config.FromEnv(env(vars))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.QueueURL == "" || cfg.SQSEndpointURL != "http://localhost:4566" {
+		t.Errorf("queue wiring not read: %+v", cfg)
+	}
+	if cfg.DaemonBatch != 10 || cfg.DaemonMessageTimeout != 2*time.Minute {
+		t.Errorf("batch/timeout = %d/%s, want 10/2m", cfg.DaemonBatch, cfg.DaemonMessageTimeout)
+	}
+}
+
+func TestFromEnv_DaemonTimeoutAcceptsBareSeconds(t *testing.T) {
+	vars := complete()
+	vars["ALERTDEST_DAEMON_MESSAGE_TIMEOUT"] = "90"
+
+	cfg, err := config.FromEnv(env(vars))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.DaemonMessageTimeout != 90*time.Second {
+		t.Errorf("DaemonMessageTimeout = %s, want 90s", cfg.DaemonMessageTimeout)
+	}
+}
+
+func TestFromEnv_RejectsBadDaemonSettings(t *testing.T) {
+	for name, pair := range map[string][2]string{
+		"batch zero":           {"ALERTDEST_DAEMON_BATCH", "0"},
+		"batch over SQS limit": {"ALERTDEST_DAEMON_BATCH", "11"},
+		"batch not a number":   {"ALERTDEST_DAEMON_BATCH", "many"},
+		"timeout garbage":      {"ALERTDEST_DAEMON_MESSAGE_TIMEOUT", "soon"},
+		"timeout negative":     {"ALERTDEST_DAEMON_MESSAGE_TIMEOUT", "-5s"},
+		// Under the 5s soft deadline, every delivery would be abandoned.
+		"timeout under reserve": {"ALERTDEST_DAEMON_MESSAGE_TIMEOUT", "5s"},
+	} {
+		vars := complete()
+		vars[pair[0]] = pair[1]
+		if _, err := config.FromEnv(env(vars)); err == nil {
+			t.Errorf("%s: FromEnv accepted %s=%s", name, pair[0], pair[1])
+		}
+	}
+}

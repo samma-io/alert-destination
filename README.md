@@ -1,15 +1,16 @@
 # alert-destination
 
-The alert router of [`samma-io/aws-siem`](https://github.com/samma-io/aws-siem): a Go Lambda
+The alert router of [`samma-io/aws-siem`](https://github.com/samma-io/aws-siem): a Go service
 that drains the detection queue and delivers each `detection.alert.v1` message to the places
-humans read, exactly once per destination.
+humans read, exactly once per destination. It runs as a Lambda, or as a daemon anywhere else
+(see [Running outside Lambda](#running-outside-lambda)).
 
 ```
-detection-engine ──► SQS detections-alerts ──► alert-destination ──┬──► Slack   chat.postMessage
- (one queue, every lane)   visibility 120s        (Lambda, batch_size=1) └──► GitHub  POST /repos/{owner}/{repo}/issues
-                           DLQ after 5 receives              │
-                                                             ▼
-                                             DynamoDB delivery ledger (what reached where, and why not)
+detection-engine ──► SQS detections-alerts ──► alert-destination ──┬──► S3 archive  alerts/log_source=…/date=…/<id>.json  (first, optional)
+ (one queue, every lane)  visibility ≥ 6×timeout  (Lambda/daemon)  ├──► Slack       chat.postMessage
+                          DLQ after 5 receives           │         └──► GitHub      POST /repos/{owner}/{repo}/issues
+                                                         ▼
+                                        DynamoDB delivery ledger (what reached where, and why not)
 
                       any routed destination undelivered ──► invocation fails ──► SQS redelivers ──► DLQ ──► alarm
 ```
@@ -21,12 +22,17 @@ Sigma rules over each lane in `detection-engine`. Every match becomes one
 `detection.alert.v1` message on a single SQS queue. This function is that queue's only
 consumer. It routes by `(level, log_source)` to Slack and/or GitHub, records every delivery in
 a DynamoDB ledger so a redelivered message never notifies anyone twice, and fails the
-invocation whenever an alert did not reach every destination it was routed to. Archiving the
-matched record is deliberately not its job; the alert's `provenance` names the object in S3.
+invocation whenever an alert did not reach every destination it was routed to.
 
-The Terraform that deploys it (function, ledger table, queue wiring, SSM parameters, alarms)
-is the `alert-destination` module in `aws-siem`. This repository holds only the code and
-publishes the deployment package.
+With `ALERTDEST_ARCHIVE_BUCKET` set, every alert is first written to S3 (see
+[The archive](#the-archive)), so there is a durable, Athena-queryable record of what the
+detection plane said. The matched record itself is not copied; the alert's `provenance` names
+the object it came from.
+
+The Terraform that deploys it (function, ledger table, queue wiring, SSM parameters, archive
+grant) is the `alert-destination` module in `aws-siem`. This repository holds the code and the
+`Dockerfile`; images are built and pushed by us (see
+[Image and deployment](#image-and-deployment)).
 
 ## The one rule
 
@@ -46,7 +52,8 @@ make                    # gofmt check, go vet, go test -race
 make test-integration   # starts DynamoDB Local, runs the delivery-contract suite, leaves it up
 make local-down         # stops DynamoDB Local
 make build              # bin/bootstrap (linux/amd64, static)
-make package            # dist/alert-destination-<version>.zip + .zip.sha256
+make image              # ghcr.io/samma-io/alert-destination:<short sha>
+make lambda-zip         # dist/alert-destination.zip, bootstrap copied out of the image
 ```
 
 The integration suite (`integration/`, build tag `integration`) is the standalone run of the
@@ -58,11 +65,9 @@ failing GitHub through all five receives and asserts that Slack was notified exa
 that every invocation failed, and that the ledger ends up saying `slack: delivered` and
 `github: failed, permanent, attempts=5`.
 
-There is no `docker compose up` that runs the handler itself. It is an SQS-triggered Lambda:
-running it outside Lambda would need the Runtime Interface Emulator, an SQS event source, an
-SSM emulator for the tokens and either real destinations or the same fakes the suite already
-has. The suite exercises the same code path with less machinery, so it is the supported way
-to run the service on a laptop. To hit real destinations once, use the smoke tests below.
+The suite is still the quickest way to exercise the handler on a laptop. To run the real
+image against a queue, see [Running outside Lambda](#running-outside-lambda); to hit real
+destinations once, use the smoke tests below.
 
 **Smoke tests** (`make smoke`, build tag `smoke`) post one clearly-marked test message to a
 real Slack channel and open one clearly-marked issue in a real repository. They take their
@@ -93,17 +98,24 @@ error, so a half-wired function refuses to start instead of draining the queue.
 | `ALERTDEST_GITHUB_TOKEN_PARAM` | yes | | SSM parameter **name** holding the GitHub fine-grained PAT. |
 | `ALERTDEST_ROUTES_PARAM` | no | | SSM parameter **name** whose value is the routing table YAML. Highest precedence. |
 | `ALERTDEST_ROUTES_PATH` | no | | Path to a routing table YAML file. Used when `ALERTDEST_ROUTES_PARAM` is unset. |
+| `ALERTDEST_ARCHIVE_BUCKET` | no | | S3 bucket every alert is written to before any delivery. Unset turns archiving off. See [The archive](#the-archive). |
+| `ALERTDEST_QUEUE_URL` | daemon only | | SQS queue to long-poll when not running in Lambda. Ignored in Lambda. |
+| `ALERTDEST_DAEMON_BATCH` | no | `1` | Daemon only: messages per receive, 1 to 10. Each is still handled and deleted on its own. |
+| `ALERTDEST_DAEMON_MESSAGE_TIMEOUT` | no | `60s` | Daemon only: each message's deadline, the equivalent of the Lambda timeout. A Go duration or whole seconds; must exceed the soft deadline. |
 | `ALERTDEST_SOFT_DEADLINE_SECONDS` | no | `5` | Time held back from the invocation so the outcome can be recorded when the budget runs out. Must be a positive integer. |
 | `ALERTDEST_LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error`. An unknown value falls back to `info` rather than silencing the service. |
 | `ALERTDEST_DYNAMODB_ENDPOINT_URL` | no | | Endpoint override for DynamoDB. Local runs and tests only. |
 | `ALERTDEST_SSM_ENDPOINT_URL` | no | | Endpoint override for SSM. Local runs and tests only. |
+| `ALERTDEST_S3_ENDPOINT_URL` | no | | Endpoint override for S3 (path-style). Local runs and tests only. |
+| `ALERTDEST_SQS_ENDPOINT_URL` | no | | Endpoint override for SQS. Local runs only. |
 | `ALERTDEST_SLACK_BASE_URL` | no | `https://slack.com/api` | Slack API root. Tests only. |
 | `ALERTDEST_GITHUB_BASE_URL` | no | `https://api.github.com` | GitHub API root. GitHub Enterprise or tests. |
 
 Reading a `SecureString` needs `kms:Decrypt` on its key as well as `ssm:GetParameters`;
 without it the failure looks like a bad token downstream. Tokens are cached for the life of
-the execution environment and dropped on an authentication failure, so a rotated credential
-is picked up within one container lifetime with no redeploy.
+the process and dropped when a destination reports an authentication failure (Slack
+`invalid_auth`, `token_revoked`, …; GitHub 401 or 404), so the next delivery re-reads the
+parameter and a rotated credential is picked up with no redeploy and no cold start.
 
 ## Routing table
 
@@ -125,7 +137,7 @@ with a wildcard source, which beats a wildcard level with an exact source, which
 all-wildcard rule. Wildcards are always written `"*"`; a missing field is a validation error,
 never an implied wildcard. Levels are Sigma's `informational`, `low`, `medium`, `high`,
 `critical`; log sources are the `aws-siem` lane names (`aws`, `github`, `dns`, `alb`, `slack`,
-`onepassword`, `workspace`, `gcp`). An unknown level or source is counted in metrics and
+`onepassword`, `workspace`, `gcp`, `cloudflare`). An unknown level or source is counted in metrics and
 still delivered; every lookup is total, so no alert can resolve to nowhere.
 
 ```yaml
@@ -137,11 +149,12 @@ routes:
       - {to: slack,  target: "C0EXAMPLE1"}                  # channel id, not name
       - {to: github, target: "example-org/security-alerts"}  # owner/repo
 
-  # High alerts from the aws lane go to a dedicated channel.
+  # High alerts from the aws lane go to a dedicated channel. This exact
+  # (level, log_source) pair beats the wildcard route below.
   - level: high
     log_source: aws
     deliveries:
-      - {to: slack, target: "C0EXAMPLE1"}
+      - {to: slack, target: "C0EXAMPLEAWS"}
 
   # Everything else.
   - level: "*"
@@ -200,8 +213,12 @@ always presents the same id. That is what makes the ledger below work.
 ## Idempotency and the ledger
 
 The ledger is one DynamoDB table: `pk = ALERT#<alert id>`, `sk = DEST#<destination>#<target>`,
-one row per `(alert, destination, target)`, with `status`, `attempts`, the failure detail,
-and a TTL (`expires_at`) comfortably longer than SQS's maximum redrive window. On each
+one row per `(alert, destination, target)`, with `status`, `attempts`, and a TTL
+(`expires_at`) comfortably longer than SQS's maximum redrive window. A delivered row carries
+`ref`, what the destination assigned: `channel` and `ts` for Slack, `number` and `html_url`
+for GitHub, `bucket` and `key` for the archive. A failed row carries `error_code` (Slack's
+error string, GitHub's status name such as `unprocessable_entity`, `rate_limited`,
+`abandoned` for the soft deadline), `http_status`, `permanent` and `error_message`. On each
 receive the handler reads the alert's rows, skips every destination already `delivered`,
 attempts the rest, and writes the outcome. The delivered row is written with a conditional
 put (`attribute_not_exists`), so a race between two invocations of the same alert is settled
@@ -229,7 +246,7 @@ Rules that hold the design together:
 Things that look wrong but are deliberate:
 
 - **No GitHub issue search before creating.** GitHub's search index lags seconds to minutes
-  and the retry interval is 120s, so the check misses in exactly the window it exists for,
+  and the retry interval is the queue's visibility timeout, so the check misses in exactly the window it exists for,
   and at 30 requests a minute it starts refusing during any burst. The ledger is strongly
   consistent. The alert id is in the issue *title* instead, so a duplicate from the crash
   window is obvious and findable.
@@ -247,9 +264,79 @@ Things that look wrong but are deliberate:
 - **`Retry-After` is capped.** GitHub's secondary-rate-limit `Retry-After` is routinely 60s,
   which would sleep through the function's entire budget and end in `Task timed out` with
   nothing recorded. SQS's redelivery is the long backoff.
+- **Slack's `ratelimited` is retried in-process although it arrives as HTTP 200.** Slack's
+  transport has a policy that reads the body; a rate-limited call posted nothing, so retrying
+  it cannot duplicate. It honours `Retry-After` up to the same cap.
 - **Slack is hand-rolled rather than a library.** The decision that matters is permanent vs
   transient, and Slack encodes it as `{"ok":false,"error":…}` on an HTTP 200, so the
   classification has to be written here regardless.
+
+## The archive
+
+With `ALERTDEST_ARCHIVE_BUCKET` set, every alert is written, before any destination is
+attempted, to
+
+```
+s3://<bucket>/alerts/log_source=<lane>/date=<YYYY-MM-DD of alerted_at, UTC>/<alert id>.json
+```
+
+The object is the queue message exactly as received, compacted onto one line with a trailing
+newline: one alert per object, one JSON document per line, which is what the `detections`
+Glue table in `aws-siem` reads (a single `line string` column, partitions projected on
+`log_source` and `date`). A `log_source` that cannot be a partition value is filed under
+`unknown`.
+
+- **Idempotent.** The key depends only on the alert, so a replay rewrites the same object.
+  The write is also recorded in the ledger as destination `archive` (target: the bucket), so a
+  redelivery normally skips it altogether.
+- **It gates delivery.** A failed archive write fails the invocation before anyone is notified,
+  the same as an unreadable ledger, and SQS redelivers. The failure is recorded as a failed
+  `archive` row and counted in `ArchiveWriteFailures`. The trade is deliberate: every alert a
+  human saw is in the archive.
+- **Permissions:** `s3:PutObject` on `<bucket>/alerts/*` only. Nothing reads the bucket, so
+  there is no `s3:GetObject`. With SSE-KMS under a customer key, add `kms:GenerateDataKey`.
+
+## Running outside Lambda
+
+The same image runs as a long-lived process. With `AWS_LAMBDA_RUNTIME_API` unset (the Lambda
+runtime sets it; nothing else does) and `ALERTDEST_QUEUE_URL` set, it long-polls that queue
+itself, 20 s per receive, `ALERTDEST_DAEMON_BATCH` messages at a time (default 1). Each message
+goes through the same handler as a Lambda invocation, with its own deadline of
+`ALERTDEST_DAEMON_MESSAGE_TIMEOUT` (default 60s) so the soft deadline behaves the same:
+
+- handled successfully: the message is deleted;
+- anything undelivered: the message is left alone, SQS makes it visible again after the
+  visibility timeout, and the redrive policy moves it to the DLQ after five receives, exactly
+  as in Lambda;
+- `SIGTERM` or `SIGINT`: polling stops, the message in hand finishes within its deadline and
+  is deleted if it succeeded, the rest of the batch is left for redelivery, and the process
+  exits 0.
+
+With neither a Lambda runtime nor a queue URL it exits 1 with an error saying so. A receive
+error (throttling, an expiring credential) is logged and retried with backoff up to a minute
+rather than ending the process.
+
+The queue's visibility timeout must be longer than the message timeout, as it must be longer
+than the Lambda timeout. The daemon needs `sqs:ReceiveMessage` and `sqs:DeleteMessage` on the
+queue in addition to the Lambda's permissions below. Metrics are the same EMF lines on
+stdout; outside Lambda they become CloudWatch metrics only if the log shipper understands
+EMF (the CloudWatch agent does, the `awslogs` driver does not).
+
+Locally, against localstack or ElasticMQ:
+
+```bash
+make image
+docker run --rm \
+  -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test \
+  -e ALERTDEST_QUEUE_URL=http://localstack:4566/000000000000/alerts \
+  -e ALERTDEST_SQS_ENDPOINT_URL=http://localstack:4566 \
+  -e ALERTDEST_DYNAMODB_ENDPOINT_URL=http://localstack:4566 \
+  -e ALERTDEST_SSM_ENDPOINT_URL=http://localstack:4566 \
+  -e ALERTDEST_LEDGER_TABLE=ledger \
+  -e ALERTDEST_SLACK_TOKEN_PARAM=/alert-destination/slack \
+  -e ALERTDEST_GITHUB_TOKEN_PARAM=/alert-destination/github \
+  ghcr.io/samma-io/alert-destination:$(git rev-parse --short HEAD)
+```
 
 ## Data handling
 
@@ -266,6 +353,7 @@ account.
 cmd/alert-destination/   entrypoint: config, wiring, the SQS handler
 internal/config/         env -> Config, every problem in one error, no defaults for wiring
 internal/alert/          the consumed detection.alert.v1 envelope
+internal/archive/        the S3 copy of every alert, and its key
 internal/routing/        (level, log_source) -> destinations; table loading and validation
 internal/deliver/        the orchestrator and the one rule above
 internal/destination/    the Destination contract, the registry, permanent vs transient
@@ -275,34 +363,45 @@ internal/ledger/         what has been delivered where, and why anything failed
 internal/render/         alert -> Slack blocks / GitHub issue, with byte budgets
 internal/httpx/          the retrying transport
 internal/secrets/        SSM reader with a warm-container cache
+internal/daemon/         the SQS poll loop for running outside Lambda
 internal/awsadapt/       the only package that imports the AWS SDK
 internal/version/        the build version, set at link time
 internal/arch/           tests about the shape of the codebase, not its behaviour
 integration/             the delivery-contract suite (build tag `integration`)
 hack/                    DynamoDB Local compose file, scrub gate
+Dockerfile               static build, /app/bootstrap on distroless/static
 ```
 
-## Artifact and deployment
+## Image and deployment
 
-Every tag `v*` publishes a GitHub Release with two assets:
+There are no GitHub Releases. We build and push the image ourselves:
 
-- `alert-destination-<tag>.zip`: a Lambda deployment package for `provided.al2023` on
-  `x86_64`, containing one static binary named `bootstrap` built with
-  `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 -trimpath -ldflags '-s -w'` and the tag baked in as
-  the version (it appears in the `User-Agent` sent to GitHub as
-  `samma-io-alert-destination/<tag>`).
-- `alert-destination-<tag>.zip.sha256`: its checksum in `sha256sum` format.
+```bash
+make image push IMAGE=ghcr.io/samma-io/alert-destination TAG=$(git rev-parse --short HEAD)
+make lambda-zip          # dist/alert-destination.zip
+```
 
-The `aws-siem` module fetches the zip by tag, verifies it against the `.sha256`, and passes
-it to `aws_lambda_function` as `filename` plus `source_code_hash`. `make package` produces the
-same two files locally under `dist/`.
+`IMAGE` defaults to `ghcr.io/samma-io/alert-destination` and `TAG` to the short git sha,
+which is the recommended tag (no `v` prefix). `PLATFORM` defaults to `linux/amd64`, because
+the Lambda is `x86_64`. The image is a static binary built with
+`CGO_ENABLED=0 -trimpath -ldflags '-s -w'` and the tag baked in as the version (it appears in
+the `User-Agent` sent to GitHub as `samma-io-alert-destination/<tag>`), at `/app/bootstrap`
+on `gcr.io/distroless/static-debian12:nonroot`, running as uid 65532.
+
+`make lambda-zip` copies `/app/bootstrap` out of the image and zips it as a single file
+named `bootstrap` at the root: the deployment package for `provided.al2023`. The file's
+timestamp is pinned, so the same image gives the same zip and the same `source_code_hash`.
+`aws-siem/hack/build-images.sh` does the same for every repository, then the
+`alert-destination` module takes the zip as `zip_path`. CI builds the image (never pushes
+it), checks the zip, and scans the image with Trivy.
 
 The function needs: `sqs:ReceiveMessage/DeleteMessage/GetQueueAttributes` on the alert queue;
 `dynamodb:PutItem/UpdateItem/Query` on the ledger table; `ssm:GetParameters` on the token
-parameters (and the routes parameter, if used) plus `kms:Decrypt` on their key. The event
-source mapping uses `batch_size = 1` and a `maximum_concurrency`; the queue's visibility
-timeout should be at least twice the function timeout, with a redrive policy of five
-receives to a dead-letter queue that has an alarm on it.
+parameters (and the routes parameter, if used) plus `kms:Decrypt` on their key; and, with an
+archive, `s3:PutObject` on `<bucket>/alerts/*`. The event source mapping uses
+`batch_size = 1` and a `maximum_concurrency`; the queue's visibility timeout should be at
+least six times the function timeout, with a redrive policy of five receives to a
+dead-letter queue that has an alarm on it.
 
 Before the first alerts flow: create a Slack app with the `chat:write` bot scope, install it,
 **invite the bot to every channel in the table**, and store the `xoxb-…` token in the Slack
