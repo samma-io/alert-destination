@@ -80,7 +80,7 @@ func TestDeliver_CreatesAnIssueInTheRoutedRepository(t *testing.T) {
 	var got capture
 	c := serve(t, handler{status: 201, body: created}, &got)
 
-	if err := c.Deliver(context.Background(), testAlert(), "example-org/detections"); err != nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "example-org/detections"); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 
@@ -98,7 +98,7 @@ func TestDeliver_MakesExactlyOneAPICall(t *testing.T) {
 	var got capture
 	c := serve(t, handler{status: 201, body: created}, &got)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); err != nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 	if got.requests != 1 {
@@ -110,7 +110,7 @@ func TestDeliver_SendsTheHeadersGitHubExpects(t *testing.T) {
 	var got capture
 	c := serve(t, handler{status: 201, body: created}, &got)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); err != nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 	if got.auth != "Bearer github_pat_test" {
@@ -128,7 +128,7 @@ func TestDeliver_PutsTheAlertIDInTheTitle(t *testing.T) {
 	var got capture
 	c := serve(t, handler{status: 201, body: created}, &got)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); err != nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 	title, _ := got.body["title"].(string)
@@ -141,7 +141,7 @@ func TestDeliver_AppliesSeverityAndSourceLabels(t *testing.T) {
 	var got capture
 	c := serve(t, handler{status: 201, body: created}, &got)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); err != nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 	raw, _ := json.Marshal(got.body["labels"])
@@ -156,7 +156,7 @@ func TestDeliver_RejectsAMalformedTarget(t *testing.T) {
 	var got capture
 	c := serve(t, handler{status: 201, body: created}, &got)
 
-	err := c.Deliver(context.Background(), testAlert(), "not-a-repo")
+	_, err := c.Deliver(context.Background(), testAlert(), "not-a-repo")
 	if err == nil {
 		t.Fatal("Deliver succeeded with a target that is not owner/repo")
 	}
@@ -173,7 +173,7 @@ func TestDeliver_RejectsAMalformedTarget(t *testing.T) {
 func TestDeliver_ValidationFailureIsPermanent(t *testing.T) {
 	c := serve(t, handler{status: 422, body: `{"message":"Validation Failed"}`}, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "o/r")
+	_, err := c.Deliver(context.Background(), testAlert(), "o/r")
 	if !destination.IsPermanent(err) {
 		t.Errorf("422 is not permanent: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestDeliver_ValidationFailureIsPermanent(t *testing.T) {
 func TestDeliver_IssuesDisabledIsPermanent(t *testing.T) {
 	c := serve(t, handler{status: 410, body: `{"message":"Issues are disabled"}`}, nil)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); !destination.IsPermanent(err) {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); !destination.IsPermanent(err) {
 		t.Errorf("410 is not permanent: %v", err)
 	}
 }
@@ -193,7 +193,7 @@ func TestDeliver_IssuesDisabledIsPermanent(t *testing.T) {
 func TestDeliver_UnauthorizedIsAnAuthFailure(t *testing.T) {
 	c := serve(t, handler{status: 401, body: `{"message":"Bad credentials"}`}, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "o/r")
+	_, err := c.Deliver(context.Background(), testAlert(), "o/r")
 	if !destination.IsAuthFailure(err) {
 		t.Errorf("401 is not an auth failure: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestDeliver_UnauthorizedIsAnAuthFailure(t *testing.T) {
 func TestDeliver_NotFoundIsAnAuthFailure(t *testing.T) {
 	c := serve(t, handler{status: 404, body: `{"message":"Not Found"}`}, nil)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); !destination.IsAuthFailure(err) {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); !destination.IsAuthFailure(err) {
 		t.Errorf("404 is not an auth failure: %v", err)
 	}
 }
@@ -218,7 +218,7 @@ func TestDeliver_RateLimited403IsTransient(t *testing.T) {
 		headers: map[string]string{"X-RateLimit-Remaining": "0"},
 	}, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "o/r")
+	_, err := c.Deliver(context.Background(), testAlert(), "o/r")
 	if err == nil {
 		t.Fatal("Deliver succeeded on a 403")
 	}
@@ -234,7 +234,7 @@ func TestDeliver_RetryAfter403IsTransient(t *testing.T) {
 		headers: map[string]string{"Retry-After": "60"},
 	}, nil)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); destination.IsPermanent(err) {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); destination.IsPermanent(err) {
 		t.Error("a secondary-rate-limit 403 must be transient")
 	}
 }
@@ -245,7 +245,7 @@ func TestDeliver_PermissionDenied403IsPermanent(t *testing.T) {
 		body:   `{"message":"Resource protected by organization SAML enforcement"}`,
 	}, nil)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); !destination.IsPermanent(err) {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); !destination.IsPermanent(err) {
 		t.Errorf("a 403 with no rate-limit marker must be permanent: %v", err)
 	}
 }
@@ -253,7 +253,7 @@ func TestDeliver_PermissionDenied403IsPermanent(t *testing.T) {
 func TestDeliver_ServerErrorIsTransient(t *testing.T) {
 	c := serve(t, handler{status: 502, body: `{"message":"Bad gateway"}`}, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "o/r")
+	_, err := c.Deliver(context.Background(), testAlert(), "o/r")
 	if err == nil {
 		t.Fatal("Deliver succeeded on a 502")
 	}
@@ -265,7 +265,7 @@ func TestDeliver_ServerErrorIsTransient(t *testing.T) {
 func TestDeliver_TooManyRequestsIsTransient(t *testing.T) {
 	c := serve(t, handler{status: 429, body: `{"message":"Too many requests"}`}, nil)
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); destination.IsPermanent(err) {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); destination.IsPermanent(err) {
 		t.Error("a 429 must be transient")
 	}
 }
@@ -273,7 +273,7 @@ func TestDeliver_TooManyRequestsIsTransient(t *testing.T) {
 func TestDeliver_ErrorsDoNotLeakTheToken(t *testing.T) {
 	c := serve(t, handler{status: 422, body: `{"message":"Validation Failed"}`}, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "o/r")
+	_, err := c.Deliver(context.Background(), testAlert(), "o/r")
 	if strings.Contains(err.Error(), "github_pat_test") {
 		t.Fatalf("the PAT appears in an error: %v", err)
 	}
@@ -284,10 +284,79 @@ func TestDeliver_FailsWhenTheTokenCannotBeRead(t *testing.T) {
 	c := serve(t, handler{status: 201, body: created}, &got)
 	c.Token = func(context.Context) (string, error) { return "", context.DeadlineExceeded }
 
-	if err := c.Deliver(context.Background(), testAlert(), "o/r"); err == nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "o/r"); err == nil {
 		t.Fatal("Deliver succeeded without a token")
 	}
 	if got.requests != 0 {
 		t.Error("a request was sent despite having no token")
+	}
+}
+
+// The issue number and url are what the ledger records, so "which issue is this
+// alert" is a lookup rather than a search.
+func TestDeliver_ReturnsTheIssueAsTheRef(t *testing.T) {
+	c := serve(t, handler{status: 201, body: created}, nil)
+
+	ref, err := c.Deliver(context.Background(), testAlert(), "o/r")
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if ref["number"] != "412" || ref["html_url"] != "https://github.invalid/o/r/issues/412" {
+		t.Errorf("ref = %v, want the issue number and html_url", ref)
+	}
+}
+
+// The issue exists however the body reads; failing here would open a second one
+// on the retry.
+func TestDeliver_AnUnreadable201IsStillADelivery(t *testing.T) {
+	c := serve(t, handler{status: 201, body: `not json`}, nil)
+
+	ref, err := c.Deliver(context.Background(), testAlert(), "o/r")
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if ref != nil {
+		t.Errorf("ref = %v, want nil", ref)
+	}
+}
+
+func TestDeliver_FailureCarriesTheCodeAndStatus(t *testing.T) {
+	c := serve(t, handler{status: 422, body: `{"message":"Validation Failed"}`}, nil)
+
+	_, err := c.Deliver(context.Background(), testAlert(), "o/r")
+	if code, status := destination.Detail(err); code != "unprocessable_entity" || status != 422 {
+		t.Errorf("Detail = (%q, %d), want (unprocessable_entity, 422)", code, status)
+	}
+}
+
+func TestDeliver_ThrottlingIsCodedRateLimited(t *testing.T) {
+	c := serve(t, handler{status: 403, body: `{"message":"API rate limit exceeded"}`,
+		headers: map[string]string{"X-RateLimit-Remaining": "0"}}, nil)
+
+	_, err := c.Deliver(context.Background(), testAlert(), "o/r")
+	if code, status := destination.Detail(err); code != "rate_limited" || status != 403 {
+		t.Errorf("Detail = (%q, %d), want (rate_limited, 403)", code, status)
+	}
+}
+
+func TestDeliver_AnAuthFailureInvalidatesTheToken(t *testing.T) {
+	c := serve(t, handler{status: 401, body: `{"message":"Bad credentials"}`}, nil)
+	invalidated := 0
+	c.InvalidateToken = func() { invalidated++ }
+
+	c.Deliver(context.Background(), testAlert(), "o/r")
+	if invalidated != 1 {
+		t.Errorf("InvalidateToken called %d times, want 1", invalidated)
+	}
+}
+
+func TestDeliver_AValidationFailureKeepsTheToken(t *testing.T) {
+	c := serve(t, handler{status: 422, body: `{"message":"Validation Failed"}`}, nil)
+	invalidated := 0
+	c.InvalidateToken = func() { invalidated++ }
+
+	c.Deliver(context.Background(), testAlert(), "o/r")
+	if invalidated != 0 {
+		t.Error("a 422 dropped the cached token")
 	}
 }

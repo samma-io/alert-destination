@@ -50,6 +50,29 @@ jobs:
           GOARCH: amd64
         run: go build -trimpath -ldflags='-s -w' -o bin/bootstrap ./cmd/alert-destination
 
+  # The image is built here and never pushed: images are built and pushed by
+  # aws-siem/hack/build-images.sh. This proves the Dockerfile builds, that the
+  # Lambda zip can be extracted from it, and that the image carries no
+  # HIGH/CRITICAL finding with a fix available.
+  image:
+    name: image (build + trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: make image IMAGE=alert-destination TAG=ci
+      - name: extract the lambda zip
+        run: |
+          make lambda-zip IMAGE=alert-destination TAG=ci
+          unzip -l dist/alert-destination.zip | grep -q ' bootstrap$'
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: alert-destination:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
   scrub:
     runs-on: ubuntu-latest
     steps:

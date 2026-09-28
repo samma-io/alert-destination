@@ -1,6 +1,7 @@
 package alert_test
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 	"time"
@@ -135,5 +136,23 @@ func TestKnownSchema_TrueForTheVersionWeWereBuiltAgainst(t *testing.T) {
 	}
 	if !a.KnownSchema() {
 		t.Error("KnownSchema() = false, want true")
+	}
+}
+
+// The archive stores Raw, one alert per line, so it must be the whole message --
+// fields this service does not declare included -- on a single line.
+func TestDecode_KeepsTheWholeMessageOnOneLine(t *testing.T) {
+	body := "{\n  \"schema_version\": \"detection.alert.v1\",\n  \"id\": \"det_1\",\n" +
+		"  \"rule\": {\"level\": \"high\"},\n  \"added_later\": {\"x\": 1}\n}"
+
+	a, err := alert.Decode([]byte(body))
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if bytes.ContainsAny(a.Raw, "\n") {
+		t.Errorf("Raw spans lines: %s", a.Raw)
+	}
+	if !bytes.Contains(a.Raw, []byte(`"added_later":{"x":1}`)) {
+		t.Errorf("Raw dropped an undeclared field: %s", a.Raw)
 	}
 }

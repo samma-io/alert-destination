@@ -12,6 +12,10 @@
 // ledger row after every destination already accepted does not fail the
 // invocation, because failing there would convert a bookkeeping blip into a
 // guaranteed duplicate on every destination on the retry.
+//
+// When an archive is configured, the alert is written there before any
+// delivery, and a failed archive write fails the invocation before anyone is
+// notified -- the same treatment as an unreadable ledger.
 package deliver
 
 import (
@@ -23,6 +27,7 @@ import (
 	"time"
 
 	"github.com/samma-io/alert-destination/internal/alert"
+	"github.com/samma-io/alert-destination/internal/archive"
 	"github.com/samma-io/alert-destination/internal/destination"
 	"github.com/samma-io/alert-destination/internal/ledger"
 	"github.com/samma-io/alert-destination/internal/routing"
@@ -54,8 +59,23 @@ type Result struct {
 	// a future retry may re-notify a destination that already succeeded.
 	LedgerErrors int
 
+	// Archive is what happened to the archive write. ArchiveOff when no
+	// archive is configured.
+	Archive ArchiveOutcome
+
 	Match routing.Match
 }
+
+// ArchiveOutcome is what happened to one alert's archive write.
+type ArchiveOutcome string
+
+// The archive outcomes.
+const (
+	ArchiveOff     ArchiveOutcome = ""
+	ArchiveWritten ArchiveOutcome = "written"
+	ArchiveSkipped ArchiveOutcome = "skipped" // the ledger says an earlier receive wrote it
+	ArchiveFailed  ArchiveOutcome = "failed"
+)
 
 // Failure is one destination that did not receive the alert.
 type Failure struct {
@@ -70,6 +90,10 @@ type Handler struct {
 	Registry *destination.Registry
 	Ledger   *ledger.Ledger
 	Log      *slog.Logger
+
+	// Archive, when set, receives every alert before any delivery. Nil means
+	// archiving is off.
+	Archive *archive.Archive
 
 	// Reserve is time held back from delivery for recording the outcome. Zero
 	// means DefaultReserve.
@@ -115,6 +139,12 @@ func (h *Handler) Handle(ctx context.Context, a alert.Alert) (Result, error) {
 		return res, err
 	}
 
+	if h.Archive != nil {
+		if err := h.archive(ctx, &res, log, a, already); err != nil {
+			return res, err
+		}
+	}
+
 	for _, d := range order(deliveries) {
 		key := ledger.Key{AlertID: a.ID, Destination: d.To, Target: d.Target}
 
@@ -134,12 +164,14 @@ func (h *Handler) Handle(ctx context.Context, a alert.Alert) (Result, error) {
 		if err != nil {
 			// A route naming a destination this binary does not have is a
 			// deploy-time mistake, but it reaches us as one undelivered alert.
+			err = destination.WithDetail(err, "unknown_destination", 0)
 			res.Failed = append(res.Failed, Failure{Key: key, Err: err, Permanent: true})
 			h.recordFailure(ctx, &res, log, key, err, true)
 			continue
 		}
 
-		if err := dest.Deliver(ctx, a, d.Target); err != nil {
+		ref, err := dest.Deliver(ctx, a, d.Target)
+		if err != nil {
 			permanent := destination.IsPermanent(err)
 			res.Failed = append(res.Failed, Failure{Key: key, Err: err, Permanent: permanent})
 			h.recordFailure(ctx, &res, log, key, err, permanent)
@@ -148,7 +180,7 @@ func (h *Handler) Handle(ctx context.Context, a alert.Alert) (Result, error) {
 
 		res.Delivered = append(res.Delivered, key)
 
-		duplicate, err := h.Ledger.RecordDelivered(ctx, key, nil)
+		duplicate, err := h.Ledger.RecordDelivered(ctx, key, ref)
 		switch {
 		case err != nil:
 			// Deliberately not fatal on its own. The destination has the alert;
@@ -172,18 +204,61 @@ func (h *Handler) Handle(ctx context.Context, a alert.Alert) (Result, error) {
 	return res, nil
 }
 
+// archive writes the alert to the archive unless the ledger says an earlier
+// receive already did, and records the write so the next replay skips it.
+//
+// Its error fails the invocation before anything is delivered. That is the
+// price of "every notified alert is archived": an S3 outage holds notifications
+// back until it clears, exactly as a DynamoDB outage does.
+func (h *Handler) archive(ctx context.Context, res *Result, log *slog.Logger,
+	a alert.Alert, already map[string]bool) error {
+
+	key := ledger.Key{AlertID: a.ID, Destination: archive.Destination, Target: h.Archive.Bucket}
+	if already[key.SK()] {
+		res.Archive = ArchiveSkipped
+		log.Debug("archive skipped, already recorded", "bucket", h.Archive.Bucket)
+		return nil
+	}
+
+	objectKey, err := h.Archive.Put(ctx, a)
+	if err != nil {
+		res.Archive = ArchiveFailed
+		h.recordFailure(ctx, res, log, key, err, false)
+		return err
+	}
+	res.Archive = ArchiveWritten
+
+	// A lost ledger row here costs one rewrite of the same object on a replay,
+	// so it is counted and logged but never fails anything. A duplicate means
+	// two receives overlapped and both wrote the same bytes, which is harmless.
+	ref := destination.Ref{"bucket": h.Archive.Bucket, "key": objectKey}
+	if _, err := h.Ledger.RecordDelivered(ctx, key, ref); err != nil {
+		res.LedgerErrors++
+		log.Error("archived but could not record it; a retry will rewrite the object",
+			"bucket", h.Archive.Bucket, "error", err)
+	}
+	return nil
+}
+
 // recordFailure writes the forensics row. Its own failure is logged and
 // otherwise ignored: the invocation is already failing, and a missing row costs
 // the DLQ reader some detail, not correctness.
 func (h *Handler) recordFailure(ctx context.Context, res *Result, log *slog.Logger,
 	key ledger.Key, cause error, permanent bool) {
 
+	code, status := destination.Detail(cause)
 	log.Error("delivery failed",
 		"destination", key.Destination, "target", key.Target,
 		"permanent", permanent, "auth_failure", destination.IsAuthFailure(cause),
+		"code", code, "http_status", status,
 		"error", cause)
 
-	f := ledger.Failure{Permanent: permanent, Message: truncate(cause.Error(), 512)}
+	f := ledger.Failure{
+		Permanent:  permanent,
+		Code:       code,
+		HTTPStatus: status,
+		Message:    truncate(cause.Error(), 512),
+	}
 	if err := h.Ledger.RecordFailure(ctx, key, f); err != nil {
 		res.LedgerErrors++
 		log.Error("could not record the failed delivery", "error", err)
@@ -201,8 +276,10 @@ func (h *Handler) budgetLeft(ctx context.Context) error {
 		return nil
 	}
 	if remaining := time.Until(deadline); remaining <= h.reserve() {
-		return fmt.Errorf("abandoned: %s left before the deadline, under the %s reserve",
-			remaining.Round(time.Millisecond), h.reserve())
+		return destination.WithDetail(
+			fmt.Errorf("abandoned: %s left before the deadline, under the %s reserve",
+				remaining.Round(time.Millisecond), h.reserve()),
+			"abandoned", 0)
 	}
 	return nil
 }

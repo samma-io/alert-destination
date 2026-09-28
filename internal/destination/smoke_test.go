@@ -80,7 +80,7 @@ func TestSmoke_SlackAcceptsARenderedAlert(t *testing.T) {
 		Token: func(context.Context) (string, error) { return token, nil },
 	}
 
-	if err := c.Deliver(context.Background(), smokeAlert(), channel); err != nil {
+	if _, err := c.Deliver(context.Background(), smokeAlert(), channel); err != nil {
 		t.Fatalf("slack rejected the message: %v\n"+
 			"  channel_not_found -> wrong id, or the bot cannot see it\n"+
 			"  not_in_channel    -> the bot was never invited to %s\n"+
@@ -99,7 +99,7 @@ func TestSmoke_GitHubAcceptsARenderedAlert(t *testing.T) {
 		Token: func(context.Context) (string, error) { return token, nil },
 	}
 
-	if err := c.Deliver(context.Background(), smokeAlert(), repo); err != nil {
+	if _, err := c.Deliver(context.Background(), smokeAlert(), repo); err != nil {
 		t.Fatalf("github rejected the issue: %v\n"+
 			"  404 -> the fine-grained PAT was not granted %s\n"+
 			"  422 -> a label the renderer applies does not exist in that repo\n"+
@@ -120,7 +120,7 @@ func TestSmoke_ABadTokenIsAnAuthFailure(t *testing.T) {
 		Token: func(context.Context) (string, error) { return "github_pat_obviously_invalid", nil },
 	}
 
-	err := c.Deliver(context.Background(), smokeAlert(), repo)
+	_, err := c.Deliver(context.Background(), smokeAlert(), repo)
 	if err == nil {
 		t.Fatal("github accepted an invalid token")
 	}

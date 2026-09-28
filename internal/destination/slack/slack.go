@@ -20,6 +20,7 @@ import (
 
 	"github.com/samma-io/alert-destination/internal/alert"
 	"github.com/samma-io/alert-destination/internal/destination"
+	"github.com/samma-io/alert-destination/internal/httpx"
 	"github.com/samma-io/alert-destination/internal/render"
 )
 
@@ -79,6 +80,11 @@ type Client struct {
 
 	// BaseURL overrides DefaultBaseURL. Tests and localstack set it.
 	BaseURL string
+
+	// InvalidateToken, when set, is called on an authentication failure so the
+	// next delivery re-reads the token. Without it a token rotated since this
+	// process started keeps being presented until the process is recycled.
+	InvalidateToken func()
 }
 
 // Name identifies this destination in routes and in the ledger.
@@ -86,11 +92,12 @@ func (c *Client) Name() string { return "slack" }
 
 // Deliver posts one alert to one channel.
 //
-// target is the channel id the route chose.
-func (c *Client) Deliver(ctx context.Context, a alert.Alert, target string) error {
+// target is the channel id the route chose. The Ref is the channel and ts Slack
+// answered with, which is enough to find or thread on the message later.
+func (c *Client) Deliver(ctx context.Context, a alert.Alert, target string) (destination.Ref, error) {
 	token, err := c.Token(ctx)
 	if err != nil {
-		return fmt.Errorf("reading the slack token: %w", err)
+		return nil, fmt.Errorf("reading the slack token: %w", err)
 	}
 
 	payload, err := json.Marshal(map[string]any{
@@ -101,38 +108,39 @@ func (c *Client) Deliver(ctx context.Context, a alert.Alert, target string) erro
 	if err != nil {
 		// Rendering produced something unencodable. Redelivery will render the
 		// same bytes, so this will never succeed.
-		return destination.Permanent(fmt.Errorf("encoding the slack message: %w", err))
+		return nil, destination.Permanent(fmt.Errorf("encoding the slack message: %w", err))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL()+"/chat.postMessage", bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("building the slack request: %w", err)
+		return nil, fmt.Errorf("building the slack request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
 	resp, err := c.http().Do(req)
 	if err != nil {
-		return fmt.Errorf("posting to slack channel %s: %w", target, err)
+		return nil, fmt.Errorf("posting to slack channel %s: %w", target, err)
 	}
 	defer drain(resp)
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return fmt.Errorf("reading slack's response: %w", err)
+		return nil, fmt.Errorf("reading slack's response: %w", err)
 	}
 
-	var answer struct {
-		OK    bool   `json:"ok"`
-		Error string `json:"error"`
-	}
+	var answer response
 	// A body we cannot parse is only worth reporting if the status was not
 	// already telling us something.
 	_ = json.Unmarshal(body, &answer)
 
 	if answer.OK {
-		return nil
+		channel := answer.Channel
+		if channel == "" {
+			channel = target
+		}
+		return destination.Ref{"channel": channel, "ts": answer.TS}, nil
 	}
 
 	reason := answer.Error
@@ -141,17 +149,53 @@ func (c *Client) Deliver(ctx context.Context, a alert.Alert, target string) erro
 	}
 	// Deliberately does not include the request: the payload carries audit-log
 	// content and the header carries the token.
-	err = fmt.Errorf("slack rejected the message for channel %s: %s", target, reason)
+	err = destination.WithDetail(
+		fmt.Errorf("slack rejected the message for channel %s: %s", target, reason),
+		answer.Error, resp.StatusCode)
 
 	switch {
 	case authErrors[answer.Error]:
-		return destination.AuthFailure(err)
+		if c.InvalidateToken != nil {
+			c.InvalidateToken()
+		}
+		return nil, destination.AuthFailure(err)
 	case permanentErrors[answer.Error]:
-		return destination.Permanent(err)
+		return nil, destination.Permanent(err)
 	default:
-		// Includes every 5xx, ratelimited, and anything Slack adds later.
-		return err
+		// Includes every 5xx, ratelimited once the transport has given up, and
+		// anything Slack adds later.
+		return nil, err
 	}
+}
+
+// response is the part of chat.postMessage's answer this client reads.
+type response struct {
+	OK      bool   `json:"ok"`
+	Error   string `json:"error"`
+	Channel string `json:"channel"`
+	TS      string `json:"ts"`
+}
+
+// RetryPolicy is the httpx.Policy for Slack's transport.
+//
+// Slack reports throttling in the body of an HTTP 200 as
+// {"ok":false,"error":"ratelimited"}, which no status-based retry sees. Retrying
+// it is safe because a rate-limited call posted nothing. The transport honours
+// Retry-After when Slack sends one, up to its cap; past the cap the response is
+// handed back, classified as transient, and SQS redelivers.
+func RetryPolicy(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := httpx.Peek(resp, 4096)
+	if err != nil {
+		return false
+	}
+	var answer response
+	if json.Unmarshal(body, &answer) != nil {
+		return false
+	}
+	return !answer.OK && answer.Error == "ratelimited"
 }
 
 func (c *Client) baseURL() string {

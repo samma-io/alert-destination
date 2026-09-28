@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/samma-io/alert-destination/internal/alert"
 	"github.com/samma-io/alert-destination/internal/destination"
 	"github.com/samma-io/alert-destination/internal/destination/slack"
+	"github.com/samma-io/alert-destination/internal/httpx"
 )
 
 func testAlert() alert.Alert {
@@ -65,7 +67,7 @@ func TestDeliver_PostsTheAlertToTheRoutedChannel(t *testing.T) {
 	var got capture
 	c := serve(t, 200, `{"ok":true,"ts":"1700000000.000100","channel":"C0"}`, &got)
 
-	if err := c.Deliver(context.Background(), testAlert(), "C0CRIT"); err != nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "C0CRIT"); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 
@@ -87,7 +89,7 @@ func TestDeliver_AuthenticatesWithTheBotToken(t *testing.T) {
 	var got capture
 	c := serve(t, 200, `{"ok":true}`, &got)
 
-	if err := c.Deliver(context.Background(), testAlert(), "C0"); err != nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "C0"); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 
@@ -104,7 +106,7 @@ func TestDeliver_AuthenticatesWithTheBotToken(t *testing.T) {
 func TestDeliver_FailsOnOkFalseDespiteHTTP200(t *testing.T) {
 	c := serve(t, 200, `{"ok":false,"error":"channel_not_found"}`, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "C0")
+	_, err := c.Deliver(context.Background(), testAlert(), "C0")
 	if err == nil {
 		t.Fatal("Deliver reported success on ok:false")
 	}
@@ -116,7 +118,7 @@ func TestDeliver_FailsOnOkFalseDespiteHTTP200(t *testing.T) {
 func TestDeliver_ChannelNotFoundIsPermanent(t *testing.T) {
 	c := serve(t, 200, `{"ok":false,"error":"channel_not_found"}`, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "C0")
+	_, err := c.Deliver(context.Background(), testAlert(), "C0")
 	if !destination.IsPermanent(err) {
 		t.Errorf("channel_not_found is not permanent: %v", err)
 	}
@@ -125,7 +127,7 @@ func TestDeliver_ChannelNotFoundIsPermanent(t *testing.T) {
 func TestDeliver_MsgTooLongIsPermanent(t *testing.T) {
 	c := serve(t, 200, `{"ok":false,"error":"msg_too_long"}`, nil)
 
-	if err := c.Deliver(context.Background(), testAlert(), "C0"); !destination.IsPermanent(err) {
+	if _, err := c.Deliver(context.Background(), testAlert(), "C0"); !destination.IsPermanent(err) {
 		t.Errorf("msg_too_long is not permanent: %v", err)
 	}
 }
@@ -135,7 +137,7 @@ func TestDeliver_MsgTooLongIsPermanent(t *testing.T) {
 func TestDeliver_TokenRevokedIsAnAuthFailure(t *testing.T) {
 	c := serve(t, 200, `{"ok":false,"error":"token_revoked"}`, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "C0")
+	_, err := c.Deliver(context.Background(), testAlert(), "C0")
 	if !destination.IsAuthFailure(err) {
 		t.Errorf("token_revoked is not an auth failure: %v", err)
 	}
@@ -147,7 +149,7 @@ func TestDeliver_TokenRevokedIsAnAuthFailure(t *testing.T) {
 func TestDeliver_InvalidAuthIsAnAuthFailure(t *testing.T) {
 	c := serve(t, 200, `{"ok":false,"error":"invalid_auth"}`, nil)
 
-	if err := c.Deliver(context.Background(), testAlert(), "C0"); !destination.IsAuthFailure(err) {
+	if _, err := c.Deliver(context.Background(), testAlert(), "C0"); !destination.IsAuthFailure(err) {
 		t.Errorf("invalid_auth is not an auth failure: %v", err)
 	}
 }
@@ -155,7 +157,7 @@ func TestDeliver_InvalidAuthIsAnAuthFailure(t *testing.T) {
 func TestDeliver_RatelimitedIsTransient(t *testing.T) {
 	c := serve(t, 200, `{"ok":false,"error":"ratelimited"}`, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "C0")
+	_, err := c.Deliver(context.Background(), testAlert(), "C0")
 	if err == nil {
 		t.Fatal("Deliver succeeded on ratelimited")
 	}
@@ -167,7 +169,7 @@ func TestDeliver_RatelimitedIsTransient(t *testing.T) {
 func TestDeliver_ServerErrorIsTransient(t *testing.T) {
 	c := serve(t, 503, `{"ok":false,"error":"service_unavailable"}`, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "C0")
+	_, err := c.Deliver(context.Background(), testAlert(), "C0")
 	if err == nil {
 		t.Fatal("Deliver succeeded on a 503")
 	}
@@ -181,7 +183,7 @@ func TestDeliver_ServerErrorIsTransient(t *testing.T) {
 func TestDeliver_UnknownErrorCodeIsTransient(t *testing.T) {
 	c := serve(t, 200, `{"ok":false,"error":"some_new_slack_error"}`, nil)
 
-	if err := c.Deliver(context.Background(), testAlert(), "C0"); destination.IsPermanent(err) {
+	if _, err := c.Deliver(context.Background(), testAlert(), "C0"); destination.IsPermanent(err) {
 		t.Error("an unrecognised error was classified permanent; prefer retrying")
 	}
 }
@@ -191,7 +193,7 @@ func TestDeliver_FailsWhenTheTokenCannotBeRead(t *testing.T) {
 	c := serve(t, 200, `{"ok":true}`, &got)
 	c.Token = func(context.Context) (string, error) { return "", context.DeadlineExceeded }
 
-	if err := c.Deliver(context.Background(), testAlert(), "C0"); err == nil {
+	if _, err := c.Deliver(context.Background(), testAlert(), "C0"); err == nil {
 		t.Fatal("Deliver succeeded without a token")
 	}
 	if got.path != "" {
@@ -203,8 +205,107 @@ func TestDeliver_FailsWhenTheTokenCannotBeRead(t *testing.T) {
 func TestDeliver_ErrorsDoNotLeakTheToken(t *testing.T) {
 	c := serve(t, 200, `{"ok":false,"error":"channel_not_found"}`, nil)
 
-	err := c.Deliver(context.Background(), testAlert(), "C0")
+	_, err := c.Deliver(context.Background(), testAlert(), "C0")
 	if strings.Contains(err.Error(), "xoxb-test") {
 		t.Fatalf("the bot token appears in an error: %v", err)
+	}
+}
+
+// The channel and ts are what the ledger records, so "which message is this
+// alert" is a lookup rather than a search.
+func TestDeliver_ReturnsTheChannelAndTSAsTheRef(t *testing.T) {
+	c := serve(t, 200, `{"ok":true,"ts":"1700000000.000100","channel":"C0EXAMPLE1"}`, nil)
+
+	ref, err := c.Deliver(context.Background(), testAlert(), "C0")
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if ref["channel"] != "C0EXAMPLE1" || ref["ts"] != "1700000000.000100" {
+		t.Errorf("ref = %v, want the channel and ts Slack answered with", ref)
+	}
+}
+
+func TestDeliver_FailureCarriesTheCodeAndStatus(t *testing.T) {
+	c := serve(t, 200, `{"ok":false,"error":"channel_not_found"}`, nil)
+
+	_, err := c.Deliver(context.Background(), testAlert(), "C0")
+	if code, status := destination.Detail(err); code != "channel_not_found" || status != 200 {
+		t.Errorf("Detail = (%q, %d), want (channel_not_found, 200)", code, status)
+	}
+}
+
+// A rotated token must be re-read on the next delivery rather than presented
+// until the process is recycled.
+func TestDeliver_AnAuthFailureInvalidatesTheToken(t *testing.T) {
+	c := serve(t, 200, `{"ok":false,"error":"token_revoked"}`, nil)
+	invalidated := 0
+	c.InvalidateToken = func() { invalidated++ }
+
+	c.Deliver(context.Background(), testAlert(), "C0")
+	if invalidated != 1 {
+		t.Errorf("InvalidateToken called %d times, want 1", invalidated)
+	}
+}
+
+func TestDeliver_AnOrdinaryFailureKeepsTheToken(t *testing.T) {
+	c := serve(t, 200, `{"ok":false,"error":"channel_not_found"}`, nil)
+	invalidated := 0
+	c.InvalidateToken = func() { invalidated++ }
+
+	c.Deliver(context.Background(), testAlert(), "C0")
+	if invalidated != 0 {
+		t.Error("a channel error dropped the cached token")
+	}
+}
+
+// Slack reports throttling in the body of a 200, where no status-based retry
+// sees it. With the policy wired, the transport retries and the second answer
+// wins.
+func TestRetryPolicy_RetriesABodyLevelRatelimit(t *testing.T) {
+	answers := []string{`{"ok":false,"error":"ratelimited"}`, `{"ok":true,"ts":"1.2","channel":"C0"}`}
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		io.WriteString(w, answers[min(calls, len(answers)-1)])
+		calls++
+	}))
+	t.Cleanup(srv.Close)
+
+	c := &slack.Client{
+		BaseURL: srv.URL,
+		HTTP: &http.Client{Transport: &httpx.RetryTransport{
+			Base:   srv.Client().Transport,
+			Policy: slack.RetryPolicy,
+			Sleep:  func(context.Context, time.Duration) error { return nil },
+		}},
+		Token: func(context.Context) (string, error) { return "xoxb-test", nil },
+	}
+
+	ref, err := c.Deliver(context.Background(), testAlert(), "C0")
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("requests = %d, want 2 (one ratelimited, one retry)", calls)
+	}
+	if ref["ts"] != "1.2" {
+		t.Errorf("ref = %v, want the retry's answer", ref)
+	}
+}
+
+func TestRetryPolicy_LeavesOtherAnswersAlone(t *testing.T) {
+	for _, body := range []string{
+		`{"ok":true}`,
+		`{"ok":false,"error":"channel_not_found"}`,
+		`not json`,
+	} {
+		resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}
+		if slack.RetryPolicy(resp) {
+			t.Errorf("RetryPolicy retried %s", body)
+		}
+		// The policy must not consume what the client still has to read.
+		if rest, _ := io.ReadAll(resp.Body); string(rest) != body {
+			t.Errorf("body after the policy = %q, want %q", rest, body)
+		}
 	}
 }

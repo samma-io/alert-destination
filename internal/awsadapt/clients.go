@@ -6,15 +6,25 @@ import (
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
-// Options are the endpoint overrides. Both are for localstack and tests; in the
-// account they are empty and the SDK resolves the real endpoints.
+// Options say what to build. The endpoint overrides are for localstack and
+// tests; in the account they are empty and the SDK resolves the real endpoints.
 type Options struct {
-	LedgerTable         string
+	LedgerTable string
+
+	// ArchiveBucket and QueueURL are optional; Clients.Archive and
+	// Clients.Queue are nil when they are empty.
+	ArchiveBucket string
+	QueueURL      string
+
 	DynamoDBEndpointURL string
 	SSMEndpointURL      string
+	S3EndpointURL       string
+	SQSEndpointURL      string
 }
 
 // Clients is everything this service needs from AWS, already narrowed to the
@@ -26,6 +36,11 @@ type Options struct {
 type Clients struct {
 	Ledger     *LedgerStore
 	Parameters *ParameterStore
+
+	// Archive is nil unless Options.ArchiveBucket is set.
+	Archive *ObjectStore
+	// Queue is nil unless Options.QueueURL is set.
+	Queue *Queue
 }
 
 // New builds the AWS-backed implementations.
@@ -46,8 +61,30 @@ func New(ctx context.Context, opts Options) (*Clients, error) {
 		}
 	})
 
-	return &Clients{
+	clients := &Clients{
 		Ledger:     &LedgerStore{API: dynamo, Table: opts.LedgerTable},
 		Parameters: &ParameterStore{API: parameters},
-	}, nil
+	}
+
+	if opts.ArchiveBucket != "" {
+		objects := s3.NewFromConfig(cfg, func(o *s3.Options) {
+			if opts.S3EndpointURL != "" {
+				o.BaseEndpoint = &opts.S3EndpointURL
+				// Emulators serve buckets by path, not by virtual host.
+				o.UsePathStyle = true
+			}
+		})
+		clients.Archive = &ObjectStore{API: objects, Bucket: opts.ArchiveBucket}
+	}
+
+	if opts.QueueURL != "" {
+		queue := sqs.NewFromConfig(cfg, func(o *sqs.Options) {
+			if opts.SQSEndpointURL != "" {
+				o.BaseEndpoint = &opts.SQSEndpointURL
+			}
+		})
+		clients.Queue = &Queue{API: queue, URL: opts.QueueURL}
+	}
+
+	return clients, nil
 }

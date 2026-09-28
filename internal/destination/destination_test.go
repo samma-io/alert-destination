@@ -13,8 +13,10 @@ import (
 
 type stub struct{ name string }
 
-func (s stub) Name() string                                       { return s.name }
-func (s stub) Deliver(context.Context, alert.Alert, string) error { return nil }
+func (s stub) Name() string { return s.name }
+func (s stub) Deliver(context.Context, alert.Alert, string) (destination.Ref, error) {
+	return nil, nil
+}
 
 func TestPermanent_IsDetectedThroughWrapping(t *testing.T) {
 	err := fmt.Errorf("posting to slack: %w", destination.Permanent(errors.New("channel_not_found")))
@@ -85,5 +87,24 @@ func TestRegistry_NamesAreSortedSoLogsAreStable(t *testing.T) {
 
 	if got := strings.Join(r.Names(), ","); got != "github,slack" {
 		t.Errorf("Names = %s, want github,slack", got)
+	}
+}
+
+func TestDetail_IsFoundInsideAClassification(t *testing.T) {
+	err := destination.AuthFailure(destination.WithDetail(errors.New("nope"), "invalid_auth", 200))
+	wrapped := fmt.Errorf("slack: %w", err)
+
+	code, status := destination.Detail(wrapped)
+	if code != "invalid_auth" || status != 200 {
+		t.Errorf("Detail = (%q, %d), want (invalid_auth, 200)", code, status)
+	}
+	if !destination.IsAuthFailure(wrapped) || !destination.IsPermanent(wrapped) {
+		t.Error("attaching detail lost the classification")
+	}
+}
+
+func TestDetail_ZeroWhenAbsent(t *testing.T) {
+	if code, status := destination.Detail(errors.New("dial tcp: timeout")); code != "" || status != 0 {
+		t.Errorf("Detail = (%q, %d), want zero values for a transport error", code, status)
 	}
 }

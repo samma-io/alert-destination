@@ -11,6 +11,7 @@
 package alert
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,9 +37,10 @@ type Alert struct {
 	ID            string    `json:"id"`
 	AlertedAt     time.Time `json:"alerted_at"`
 
-	// LogSource is the deployment that produced this alert: aws, gcp, github,
-	// workspace or slack. Not "source" -- Vector stamps a "source" field inside
-	// every filtered event, and the two would be different things.
+	// LogSource is the aws-siem lane that produced this alert (aws, github,
+	// cloudflare, ...; routing.KnownLogSources lists them). Not "source" --
+	// Vector stamps a "source" field inside every filtered event, and the two
+	// would be different things.
 	LogSource string `json:"log_source"`
 
 	Rule       Rule       `json:"rule"`
@@ -55,6 +57,11 @@ type Alert struct {
 
 	EventSHA256 string `json:"event_sha256,omitempty"`
 	EventBytes  int    `json:"event_bytes,omitempty"`
+
+	// Raw is the message exactly as received, compacted onto one line. It is
+	// what the archive stores, so the archived alert keeps every field the
+	// producer sent, including the ones this struct does not declare.
+	Raw []byte `json:"-"`
 }
 
 // Rule is the firing rule's metadata, as the engine extracted it.
@@ -101,6 +108,14 @@ func Decode(body []byte) (Alert, error) {
 	if len(missing) > 0 {
 		return Alert{}, fmt.Errorf("%w: %v", ErrIncomplete, missing)
 	}
+
+	// One line, because the archive is read as one alert per line. Compact
+	// cannot fail on a body Unmarshal just accepted.
+	var raw bytes.Buffer
+	if err := json.Compact(&raw, body); err != nil {
+		return Alert{}, fmt.Errorf("decoding alert: %w", err)
+	}
+	a.Raw = raw.Bytes()
 
 	return a, nil
 }

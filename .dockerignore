@@ -1,0 +1,10 @@
+# Keep the build context to what the Go build reads. .git in particular: without
+# it the binary carries no VCS stamp, so an image rebuilt from the same tree
+# produces the same bootstrap and the same Lambda source_code_hash.
+.git
+.github
+bin
+dist
+hack
+integration
+*.md

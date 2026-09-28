@@ -41,6 +41,8 @@ const (
 	UnknownLevel      = "AlertsWithUnknownLevel"
 	UnknownLogSource  = "AlertsWithUnknownLogSource"
 	DefaultRoute      = "AlertsRoutedByDefault"
+	Archived          = "AlertsArchived"
+	ArchiveFailures   = "ArchiveWriteFailures"
 )
 
 // Names returns every declared metric.
@@ -49,6 +51,7 @@ func Names() []string {
 		Delivered, Skipped, Duplicates,
 		PermanentFailures, TransientFailures, AuthFailures,
 		LedgerErrors, UnknownLevel, UnknownLogSource, DefaultRoute,
+		Archived, ArchiveFailures,
 	}
 }
 
@@ -109,6 +112,16 @@ func (b *Batch) UnknownLogSource() { b.counts[UnknownLogSource]++ }
 
 // UsedDefaultRoute counts an alert no route matched.
 func (b *Batch) UsedDefaultRoute() { b.counts[DefaultRoute]++ }
+
+// Archive counts one archive write, written or failed. A write skipped because
+// the ledger already had it is neither.
+func (b *Batch) Archive(failed bool) {
+	if failed {
+		b.counts[ArchiveFailures]++
+	} else {
+		b.counts[Archived]++
+	}
+}
 
 func (b *Batch) add(metric, dest string, n float64) {
 	b.counts[metric] += n
