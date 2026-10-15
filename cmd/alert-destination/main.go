@@ -28,11 +28,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
 	awslambda "github.com/aws/aws-lambda-go/lambda"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/samma-io/alert-destination/internal/alert"
 	"github.com/samma-io/alert-destination/internal/archive"
 	"github.com/samma-io/alert-destination/internal/awsadapt"
@@ -41,10 +45,13 @@ import (
 	"github.com/samma-io/alert-destination/internal/deliver"
 	"github.com/samma-io/alert-destination/internal/destination"
 	"github.com/samma-io/alert-destination/internal/destination/github"
+	"github.com/samma-io/alert-destination/internal/destination/postgres"
 	"github.com/samma-io/alert-destination/internal/destination/slack"
 	"github.com/samma-io/alert-destination/internal/httpx"
 	"github.com/samma-io/alert-destination/internal/ledger"
 	"github.com/samma-io/alert-destination/internal/metrics"
+	"github.com/samma-io/alert-destination/internal/natsadapt"
+	"github.com/samma-io/alert-destination/internal/pgadapt"
 	"github.com/samma-io/alert-destination/internal/routing"
 	"github.com/samma-io/alert-destination/internal/secrets"
 )
@@ -70,7 +77,11 @@ func main() {
 
 	// The Lambda runtime sets this; nothing else does.
 	inLambda := os.Getenv("AWS_LAMBDA_RUNTIME_API") != ""
-	if !inLambda && cfg.QueueURL == "" {
+	if inLambda && cfg.Transport != config.TransportSQS {
+		log.Error("cannot start", "error", "a Lambda is fed by SQS; ALERTDEST_TRANSPORT must be sqs")
+		os.Exit(1)
+	}
+	if !inLambda && cfg.Transport == config.TransportSQS && cfg.QueueURL == "" {
 		log.Error("cannot start", "error", daemon.ErrNoQueue.Error())
 		os.Exit(1)
 	}
@@ -80,11 +91,12 @@ func main() {
 		cfg.QueueURL = ""
 	}
 
-	handler, aws, err := build(context.Background(), cfg, log)
+	handler, queue, closeAll, err := build(context.Background(), cfg, log)
 	if err != nil {
 		log.Error("cannot start", "error", err)
 		os.Exit(1)
 	}
+	defer closeAll()
 
 	if inLambda {
 		awslambda.Start(func(ctx context.Context, event events.SQSEvent) error {
@@ -99,12 +111,14 @@ func main() {
 	defer stop()
 
 	log.Info("polling the alert queue",
+		"transport", cfg.Transport,
 		"queue_url", cfg.QueueURL,
+		"nats_consumer", cfg.NATSStream+"/"+cfg.NATSConsumer,
 		"batch", cfg.DaemonBatch,
 		"message_timeout", cfg.DaemonMessageTimeout.String(),
 	)
 	loop := &daemon.Loop{
-		Queue:          aws.Queue,
+		Queue:          queue,
 		Batch:          cfg.DaemonBatch,
 		MessageTimeout: cfg.DaemonMessageTimeout,
 		Log:            log,
@@ -114,7 +128,8 @@ func main() {
 	}
 	if err := loop.Run(ctx); err != nil {
 		log.Error("daemon stopped", "error", err)
-		os.Exit(1)
+		closeAll()
+		os.Exit(1) //nolint:gocritic // closeAll already ran
 	}
 	log.Info("stopped")
 }
@@ -140,7 +155,15 @@ func fromLambda(event events.SQSEvent) []message {
 // Deliberately not in init(): an init() failure produces Runtime.ExitError with
 // no structured log, and it re-runs on every cold start of a container that will
 // keep failing the same way.
-func build(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.Handler, *awsadapt.Clients, error) {
+//
+// The transport picks the backing services: SQS, DynamoDB, SSM and S3 on AWS;
+// JetStream and Postgres in Kubernetes. Everything after the wiring -- routing,
+// the ledger rules, delivery -- is the same code either way.
+func build(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.Handler, daemon.Queue, func(), error) {
+	if cfg.Transport == config.TransportNATS {
+		return buildNATS(ctx, cfg, log)
+	}
+
 	aws, err := awsadapt.New(ctx, awsadapt.Options{
 		LedgerTable:         cfg.LedgerTable,
 		ArchiveBucket:       cfg.ArchiveBucket,
@@ -151,7 +174,7 @@ func build(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.H
 		SQSEndpointURL:      cfg.SQSEndpointURL,      // local runs and tests only
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// The routing table is loaded and validated here, at start, so a table that
@@ -166,37 +189,22 @@ func build(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.H
 		Parameters: aws.Parameters,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("loading the routing table: %w", err)
+		return nil, nil, nil, fmt.Errorf("loading the routing table: %w", err)
 	}
 
 	// Secrets resolve lazily, so an alert routed only to Slack is not blocked by
 	// an unreadable GitHub credential.
 	tokens := secrets.NewCache(aws.Parameters)
 
-	// One client per destination, because the retry policy is per API: Slack
-	// reports throttling in the body of an HTTP 200, GitHub in its status and
-	// headers. The ceiling on both is what stops a GitHub secondary-rate-limit
-	// Retry-After of 60s from sleeping through the whole invocation.
-	client := func(policy httpx.Policy) *http.Client {
-		return &http.Client{
-			Timeout: httpTimeout,
-			Transport: &httpx.RetryTransport{
-				Policy:     policy,
-				MaxWait:    httpx.DefaultMaxWait,
-				MaxRetries: 2,
-			},
-		}
-	}
-
 	registry := destination.NewRegistry(
 		&slack.Client{
-			HTTP:            client(slack.RetryPolicy),
+			HTTP:            httpClient(slack.RetryPolicy),
 			Token:           tokens.TokenFunc(cfg.SlackTokenParam),
 			InvalidateToken: func() { tokens.Invalidate(cfg.SlackTokenParam) },
 			BaseURL:         cfg.SlackBaseURL,
 		},
 		&github.Client{
-			HTTP:            client(nil),
+			HTTP:            httpClient(nil),
 			Token:           tokens.TokenFunc(cfg.GitHubTokenParam),
 			InvalidateToken: func() { tokens.Invalidate(cfg.GitHubTokenParam) },
 			BaseURL:         cfg.GitHubBaseURL,
@@ -209,8 +217,89 @@ func build(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.H
 	}
 
 	log.Info("starting",
+		"transport", cfg.Transport,
 		"ledger_table", cfg.LedgerTable,
 		"archive_bucket", cfg.ArchiveBucket,
+		"destinations", registry.Names(),
+		"routes", len(routes.Routes),
+		"routes_origin", string(origin),
+		"soft_deadline", cfg.SoftDeadline.String(),
+	)
+
+	var queue daemon.Queue
+	if aws.Queue != nil {
+		queue = aws.Queue
+	}
+	return &deliver.Handler{
+		Routes:   routes,
+		Registry: registry,
+		Ledger:   &ledger.Ledger{Store: aws.Ledger},
+		Archive:  arch,
+		Log:      log,
+		Reserve:  cfg.SoftDeadline,
+	}, queue, func() {}, nil
+}
+
+// buildNATS wires the Kubernetes deployment: alerts from a JetStream consumer,
+// the ledger and the postgres destination in one database. No AWS client is
+// built, so nothing here can reach for credentials that do not exist.
+func buildNATS(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.Handler, daemon.Queue, func(), error) {
+	dsn := cfg.PostgresDSN
+	if cfg.PostgresDSNFile != "" {
+		raw, err := os.ReadFile(cfg.PostgresDSNFile)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("reading the postgres DSN file: %w", err)
+		}
+		dsn = strings.TrimSpace(string(raw))
+	}
+	db, err := pgadapt.Open(ctx, dsn)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	nc, err := nats.Connect(cfg.NATSURL, nats.Name("alert-destination"), nats.MaxReconnects(-1))
+	if err != nil {
+		db.Close()
+		return nil, nil, nil, fmt.Errorf("nats connect: %w", err)
+	}
+	closeAll := func() {
+		_ = nc.Drain()
+		db.Close()
+	}
+	js, err := jetstream.New(nc)
+	if err != nil {
+		closeAll()
+		return nil, nil, nil, fmt.Errorf("jetstream: %w", err)
+	}
+	// The consumer is created by the deployment, not here: its AckWait and
+	// MaxDeliver are the redelivery policy, and that belongs with the stream.
+	consumer, err := js.Consumer(ctx, cfg.NATSStream, cfg.NATSConsumer)
+	if err != nil {
+		closeAll()
+		return nil, nil, nil, fmt.Errorf("jetstream consumer %s/%s: %w", cfg.NATSStream, cfg.NATSConsumer, err)
+	}
+
+	// Only a file: there is no SSM here, and the embedded table routes to
+	// placeholders.
+	if cfg.RoutesPath == "" {
+		closeAll()
+		return nil, nil, nil, errors.New("ALERTDEST_ROUTES_PATH is required with the nats transport")
+	}
+	routes, origin, err := routing.Select(ctx, routing.Sources{Path: cfg.RoutesPath})
+	if err != nil {
+		closeAll()
+		return nil, nil, nil, fmt.Errorf("loading the routing table: %w", err)
+	}
+
+	registry := destination.NewRegistry(&postgres.Client{DB: db})
+	if err := checkRegistered(routes, registry); err != nil {
+		closeAll()
+		return nil, nil, nil, err
+	}
+
+	log.Info("starting",
+		"transport", cfg.Transport,
+		"nats_consumer", cfg.NATSStream+"/"+cfg.NATSConsumer,
 		"destinations", registry.Names(),
 		"routes", len(routes.Routes),
 		"routes_origin", string(origin),
@@ -220,11 +309,54 @@ func build(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.H
 	return &deliver.Handler{
 		Routes:   routes,
 		Registry: registry,
-		Ledger:   &ledger.Ledger{Store: aws.Ledger},
-		Archive:  arch,
+		Ledger:   &ledger.Ledger{Store: &pgadapt.Ledger{DB: db}},
 		Log:      log,
 		Reserve:  cfg.SoftDeadline,
-	}, aws, nil
+	}, &natsadapt.Queue{Consumer: consumer}, closeAll, nil
+}
+
+// checkRegistered refuses a routing table that names a destination this
+// process has not built. Without it the first alert routed there fails at
+// delivery time, one alert at a time.
+func checkRegistered(t *routing.Table, r *destination.Registry) error {
+	var missing []string
+	seen := map[string]bool{}
+	check := func(ds []routing.Delivery) {
+		for _, d := range ds {
+			if seen[d.To] {
+				continue
+			}
+			seen[d.To] = true
+			if _, err := r.Lookup(d.To); err != nil {
+				missing = append(missing, d.To)
+			}
+		}
+	}
+	for _, rt := range t.Routes {
+		check(rt.Deliveries)
+	}
+	check(t.Default.Deliveries)
+	if len(missing) > 0 {
+		return fmt.Errorf("the routing table names destinations this deployment has not configured: %s; registered: %s",
+			strings.Join(missing, ", "), strings.Join(r.Names(), ", "))
+	}
+	return nil
+}
+
+// httpClient is one client per destination, because the retry policy is per
+// API: Slack reports throttling in the body of an HTTP 200, GitHub in its
+// status and headers. The ceiling on both is what stops a GitHub
+// secondary-rate-limit Retry-After of 60s from sleeping through the whole
+// invocation.
+func httpClient(policy httpx.Policy) *http.Client {
+	return &http.Client{
+		Timeout: httpTimeout,
+		Transport: &httpx.RetryTransport{
+			Policy:     policy,
+			MaxWait:    httpx.DefaultMaxWait,
+			MaxRetries: 2,
+		},
+	}
 }
 
 // handle processes one SQS delivery: a Lambda invocation's batch, or one
