@@ -1,4 +1,5 @@
-// Package secrets reads the destination credentials at runtime.
+// Package secrets reads the destination credentials at runtime: from SSM on
+// AWS, from mounted Secret files on Kubernetes (Files).
 //
 // The Lambda's environment holds parameter names, never values. A token in an
 // environment variable is visible in the console, in the API, and in every
@@ -85,7 +86,7 @@ func (c *Cache) Get(ctx context.Context, name string) (string, error) {
 	// changes to its value, so an unset one is the expected first-deploy state.
 	// Naming it beats a 401 from the destination, which looks like a bad token
 	// rather than an absent one.
-	return "", fmt.Errorf("parameter %s is empty or absent; the secret has not been set", name)
+	return "", fmt.Errorf("%s is empty or absent; the secret has not been set", name)
 }
 
 // Invalidate drops a cached value so the next Get re-reads it.

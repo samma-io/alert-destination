@@ -65,6 +65,14 @@ type Config struct {
 	SlackTokenParam  string
 	GitHubTokenParam string
 
+	// SlackTokenFile and GitHubTokenFile are the NATS transport's equivalent:
+	// paths to files holding the tokens (keys of a mounted Secret). Each is
+	// required only when the routing table names that destination, which is
+	// checked at start once the table is loaded. Ignored with the sqs
+	// transport, which reads SSM.
+	SlackTokenFile  string
+	GitHubTokenFile string
+
 	// RoutesParam and RoutesPath say where the routing table is loaded from:
 	// RoutesParam is an SSM parameter NAME holding the YAML, RoutesPath a file.
 	// Precedence is parameter, then file, then the table embedded in the
@@ -121,6 +129,8 @@ func FromEnv(getenv func(string) string) (Config, error) {
 		LedgerTable:      get("ALERTDEST_LEDGER_TABLE"),
 		SlackTokenParam:  get("ALERTDEST_SLACK_TOKEN_PARAM"),
 		GitHubTokenParam: get("ALERTDEST_GITHUB_TOKEN_PARAM"),
+		SlackTokenFile:   get("ALERTDEST_SLACK_TOKEN_FILE"),
+		GitHubTokenFile:  get("ALERTDEST_GITHUB_TOKEN_FILE"),
 		RoutesParam:      get("ALERTDEST_ROUTES_PARAM"),
 		RoutesPath:       get("ALERTDEST_ROUTES_PATH"),
 		ArchiveBucket:    get("ALERTDEST_ARCHIVE_BUCKET"),
@@ -160,9 +170,10 @@ func FromEnv(getenv func(string) string) (Config, error) {
 			{"ALERTDEST_GITHUB_TOKEN_PARAM", cfg.GitHubTokenParam},
 		}
 	case TransportNATS:
-		// Slack and GitHub are optional here: a destination whose token
-		// parameter is unset is not registered, and a routing table that
-		// names it then fails validation at start.
+		// Slack and GitHub are optional here: whether their token files are
+		// required depends on the routing table, which is not loaded yet.
+		// A table that names one without its ALERTDEST_*_TOKEN_FILE, or with
+		// a file that cannot be read, refuses to start.
 		required = []struct{ key, value string }{
 			{"ALERTDEST_NATS_URL", cfg.NATSURL},
 		}

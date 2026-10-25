@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -241,8 +242,9 @@ func build(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.H
 }
 
 // buildNATS wires the Kubernetes deployment: alerts from a JetStream consumer,
-// the ledger and the postgres destination in one database. No AWS client is
-// built, so nothing here can reach for credentials that do not exist.
+// the ledger and the postgres destination in one database, and Slack and
+// GitHub when the routing table names them. No AWS client is built, so nothing
+// here can reach for credentials that do not exist.
 func buildNATS(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliver.Handler, daemon.Queue, func(), error) {
 	dsn := cfg.PostgresDSN
 	if cfg.PostgresDSNFile != "" {
@@ -291,8 +293,8 @@ func buildNATS(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliv
 		return nil, nil, nil, fmt.Errorf("loading the routing table: %w", err)
 	}
 
-	registry := destination.NewRegistry(&postgres.Client{DB: db})
-	if err := checkRegistered(routes, registry); err != nil {
+	registry, err := natsRegistry(ctx, cfg, routes, &postgres.Client{DB: db}, log)
+	if err != nil {
 		closeAll()
 		return nil, nil, nil, err
 	}
@@ -315,28 +317,94 @@ func buildNATS(ctx context.Context, cfg config.Config, log *slog.Logger) (*deliv
 	}, &natsadapt.Queue{Consumer: consumer}, closeAll, nil
 }
 
+// natsRegistry builds the destinations of a nats deployment: postgres always,
+// Slack and GitHub only when the routing table names them, with their tokens
+// read from files (a mounted Secret) instead of SSM.
+//
+// A routed destination's token is read here, once, so a missing key in the
+// Secret fails the rollout rather than every alert routed there. After that
+// the cache behaves as on AWS: an authentication failure invalidates the
+// token and the next delivery re-reads the file, which picks up a rotated
+// Secret with no restart. The token is held only by the cache and sent only
+// in the destination's Authorization header; no error or log line carries it.
+func natsRegistry(ctx context.Context, cfg config.Config, routes *routing.Table, pg destination.Destination, log *slog.Logger) (*destination.Registry, error) {
+	routed := routedDestinations(routes)
+	tokens := secrets.NewCache(secrets.Files{})
+	dests := []destination.Destination{pg}
+
+	var problems []error
+	token := func(name, env, path string) bool {
+		switch {
+		case !routed[name] && path != "":
+			log.Info("token file configured for a destination no route reaches; not building it",
+				"destination", name, "env", env)
+			return false
+		case !routed[name]:
+			return false
+		case path == "":
+			problems = append(problems, fmt.Errorf("the routing table names %s; set %s to the file holding its token", name, env))
+			return false
+		}
+		if _, err := tokens.Get(ctx, path); err != nil {
+			problems = append(problems, fmt.Errorf("%s: %w", env, err))
+			return false
+		}
+		return true
+	}
+
+	if token("slack", "ALERTDEST_SLACK_TOKEN_FILE", cfg.SlackTokenFile) {
+		dests = append(dests, &slack.Client{
+			HTTP:            httpClient(slack.RetryPolicy),
+			Token:           tokens.TokenFunc(cfg.SlackTokenFile),
+			InvalidateToken: func() { tokens.Invalidate(cfg.SlackTokenFile) },
+			BaseURL:         cfg.SlackBaseURL,
+		})
+	}
+	if token("github", "ALERTDEST_GITHUB_TOKEN_FILE", cfg.GitHubTokenFile) {
+		dests = append(dests, &github.Client{
+			HTTP:            httpClient(nil),
+			Token:           tokens.TokenFunc(cfg.GitHubTokenFile),
+			InvalidateToken: func() { tokens.Invalidate(cfg.GitHubTokenFile) },
+			BaseURL:         cfg.GitHubBaseURL,
+		})
+	}
+	if len(problems) > 0 {
+		return nil, errors.Join(problems...)
+	}
+
+	registry := destination.NewRegistry(dests...)
+	if err := checkRegistered(routes, registry); err != nil {
+		return nil, err
+	}
+	return registry, nil
+}
+
+// routedDestinations is every destination name the table can deliver to.
+func routedDestinations(t *routing.Table) map[string]bool {
+	out := map[string]bool{}
+	for _, rt := range t.Routes {
+		for _, d := range rt.Deliveries {
+			out[d.To] = true
+		}
+	}
+	for _, d := range t.Default.Deliveries {
+		out[d.To] = true
+	}
+	return out
+}
+
 // checkRegistered refuses a routing table that names a destination this
 // process has not built. Without it the first alert routed there fails at
 // delivery time, one alert at a time.
 func checkRegistered(t *routing.Table, r *destination.Registry) error {
 	var missing []string
-	seen := map[string]bool{}
-	check := func(ds []routing.Delivery) {
-		for _, d := range ds {
-			if seen[d.To] {
-				continue
-			}
-			seen[d.To] = true
-			if _, err := r.Lookup(d.To); err != nil {
-				missing = append(missing, d.To)
-			}
+	for name := range routedDestinations(t) {
+		if _, err := r.Lookup(name); err != nil {
+			missing = append(missing, name)
 		}
 	}
-	for _, rt := range t.Routes {
-		check(rt.Deliveries)
-	}
-	check(t.Default.Deliveries)
 	if len(missing) > 0 {
+		sort.Strings(missing)
 		return fmt.Errorf("the routing table names destinations this deployment has not configured: %s; registered: %s",
 			strings.Join(missing, ", "), strings.Join(r.Names(), ", "))
 	}
