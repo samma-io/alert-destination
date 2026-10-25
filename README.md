@@ -135,7 +135,10 @@ routing with a table the operator did not choose is a fail-open.
 
 1. `ALERTDEST_ROUTES_PARAM`: an SSM parameter (String or SecureString) holding the YAML.
    Changing the table is then a parameter update and a cold start; nothing is rebuilt.
-2. `ALERTDEST_ROUTES_PATH`: a file, for images or layers that ship their own table.
+2. `ALERTDEST_ROUTES_PATH`: a file, for images or layers that ship their own table. On
+   Kubernetes (`ALERTDEST_TRANSPORT=nats`) this is the only source: mount the table from a
+   ConfigMap and point the variable at the mounted file. There is no SSM there, and the
+   embedded placeholder is never used.
 3. The table embedded in the binary (`internal/routing/routes.yaml`). It is a placeholder
    that names a channel and repository that do not exist; a real deployment always sets one
    of the two above. The startup log records `routes_origin` so you can see which won.
@@ -145,7 +148,8 @@ with a wildcard source, which beats a wildcard level with an exact source, which
 all-wildcard rule. Wildcards are always written `"*"`; a missing field is a validation error,
 never an implied wildcard. Levels are Sigma's `informational`, `low`, `medium`, `high`,
 `critical`; log sources are the `aws-siem` lane names (`aws`, `github`, `dns`, `alb`, `slack`,
-`onepassword`, `workspace`, `gcp`, `cloudflare`). An unknown level or source is counted in metrics and
+`onepassword`, `workspace`, `gcp`, `cloudflare`), plus the Kubernetes-only lanes `k8s` (API
+server audit) and `scanner` (samma scanner findings). An unknown level or source is counted in metrics and
 still delivered; every lookup is total, so no alert can resolve to nowhere.
 
 ```yaml
