@@ -93,9 +93,10 @@ error, so a half-wired function refuses to start instead of draining the queue.
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `ALERTDEST_LEDGER_TABLE` | yes | | DynamoDB table holding the delivery ledger (`pk`/`sk` string keys, TTL on `expires_at`). |
-| `ALERTDEST_SLACK_TOKEN_PARAM` | yes | | SSM parameter **name** holding the Slack bot token. The value is read at runtime and never appears in the environment. |
-| `ALERTDEST_GITHUB_TOKEN_PARAM` | yes | | SSM parameter **name** holding the GitHub fine-grained PAT. |
+| `ALERTDEST_TRANSPORT` | no | `sqs` | `sqs` (AWS) or `nats` (Kubernetes). See [Running on Kubernetes (NATS)](#running-on-kubernetes-nats). |
+| `ALERTDEST_LEDGER_TABLE` | sqs | | DynamoDB table holding the delivery ledger (`pk`/`sk` string keys, TTL on `expires_at`). |
+| `ALERTDEST_SLACK_TOKEN_PARAM` | sqs | | SSM parameter **name** holding the Slack bot token. The value is read at runtime and never appears in the environment. |
+| `ALERTDEST_GITHUB_TOKEN_PARAM` | sqs | | SSM parameter **name** holding the GitHub fine-grained PAT. |
 | `ALERTDEST_ROUTES_PARAM` | no | | SSM parameter **name** whose value is the routing table YAML. Highest precedence. |
 | `ALERTDEST_ROUTES_PATH` | no | | Path to a routing table YAML file. Used when `ALERTDEST_ROUTES_PARAM` is unset. |
 | `ALERTDEST_ARCHIVE_BUCKET` | no | | S3 bucket every alert is written to before any delivery. Unset turns archiving off. See [The archive](#the-archive). |
@@ -108,6 +109,11 @@ error, so a half-wired function refuses to start instead of draining the queue.
 | `ALERTDEST_SSM_ENDPOINT_URL` | no | | Endpoint override for SSM. Local runs and tests only. |
 | `ALERTDEST_S3_ENDPOINT_URL` | no | | Endpoint override for S3 (path-style). Local runs and tests only. |
 | `ALERTDEST_SQS_ENDPOINT_URL` | no | | Endpoint override for SQS. Local runs only. |
+| `ALERTDEST_NATS_URL` | nats | | JetStream server, e.g. `nats://nats.samma.svc:4222`. |
+| `ALERTDEST_NATS_STREAM` | no | `SIEM_ALERTS` | Stream holding `samma.alerts.>`. |
+| `ALERTDEST_NATS_CONSUMER` | no | `alert-destination` | Durable pull consumer on that stream. Created by the deployment, not by this service. |
+| `ALERTDEST_POSTGRES_DSN_FILE` | nats, one of | | File holding the Postgres DSN (a mounted Secret). Wins over `ALERTDEST_POSTGRES_DSN`. |
+| `ALERTDEST_POSTGRES_DSN` | nats, one of | | Postgres DSN, for local runs. |
 | `ALERTDEST_SLACK_BASE_URL` | no | `https://slack.com/api` | Slack API root. Tests only. |
 | `ALERTDEST_GITHUB_BASE_URL` | no | `https://api.github.com` | GitHub API root. GitHub Enterprise or tests. |
 
@@ -336,6 +342,33 @@ docker run --rm \
   -e ALERTDEST_SLACK_TOKEN_PARAM=/alert-destination/slack \
   -e ALERTDEST_GITHUB_TOKEN_PARAM=/alert-destination/github \
   ghcr.io/samma-io/alert-destination:$(git rev-parse --short HEAD)
+```
+
+## Running on Kubernetes (NATS)
+
+With `ALERTDEST_TRANSPORT=nats` the daemon drains a durable pull consumer on the
+`SIEM_ALERTS` stream (`samma.alerts.>`) instead of SQS, and nothing AWS is built:
+
+- **Ledger.** The ledger is the `alert_ledger` table in Postgres. It has the same rules as
+  the DynamoDB ledger: only a delivered row suppresses a retry, and a second delivered write
+  counts as a duplicate.
+- **Destination.** The `postgres` destination inserts each alert into the table named by the
+  route's target (normally `siem_alerts`), one row per alert id. A redelivery leaves the row
+  as it is.
+- **Schema.** Both tables are created at start (`internal/pgadapt/schema.sql`); the
+  statements are additive and idempotent.
+- **Routing table.** It comes from `ALERTDEST_ROUTES_PATH` (a ConfigMap), and only from
+  there. Slack and GitHub are not built in this mode, and a table that names them fails at
+  start. A table without Slack must say `require_slack: false` explicitly.
+- **Failure handling.** A failed alert is not acked, so the consumer redelivers it after
+  `AckWait`. `MaxDeliver` plays the part of the DLQ.
+
+```yaml
+require_slack: false
+routes:
+  - {level: "*", log_source: "*", deliveries: [{to: postgres, target: siem_alerts}]}
+default:
+  deliveries: [{to: postgres, target: siem_alerts}]
 ```
 
 ## Data handling

@@ -32,8 +32,9 @@ const slackDestination = "slack"
 // Adding one here without adding it to the deliver registry, or the reverse, is
 // caught by the arch test.
 var knownDestinations = map[string]bool{
-	"slack":  true,
-	"github": true,
+	"slack":    true,
+	"github":   true,
+	"postgres": true,
 }
 
 // knownLevels is Sigma's closed severity set. The producer does not validate
@@ -81,6 +82,12 @@ type Fallback struct {
 type Table struct {
 	Routes  []Route  `yaml:"routes"`
 	Default Fallback `yaml:"default"`
+
+	// RequireSlack, when explicitly false, lifts the every-route-includes-slack
+	// rule. It exists for the Kubernetes bootstrap, where alerts go only to
+	// Postgres until Slack is wired. It is written in the table, never implied,
+	// so anyone reading the table sees that nothing pages a human.
+	RequireSlack *bool `yaml:"require_slack,omitempty"`
 }
 
 // Match describes how a lookup was answered, for logging and metrics.
@@ -120,9 +127,9 @@ func Load(data []byte) (*Table, error) {
 		if r.LogSource == "" {
 			problems = append(problems, where+": log_source is empty; write \"*\" for any")
 		}
-		problems = append(problems, checkDeliveries(where, r.Deliveries)...)
+		problems = append(problems, checkDeliveries(where, r.Deliveries, t.requireSlack())...)
 	}
-	problems = append(problems, checkDeliveries("default", t.Default.Deliveries)...)
+	problems = append(problems, checkDeliveries("default", t.Default.Deliveries, t.requireSlack())...)
 
 	if len(problems) > 0 {
 		sort.Strings(problems)
@@ -131,7 +138,10 @@ func Load(data []byte) (*Table, error) {
 	return &t, nil
 }
 
-func checkDeliveries(where string, ds []Delivery) []string {
+// requireSlack is true unless the table says otherwise in so many words.
+func (t *Table) requireSlack() bool { return t.RequireSlack == nil || *t.RequireSlack }
+
+func checkDeliveries(where string, ds []Delivery, requireSlack bool) []string {
 	var problems []string
 	if len(ds) == 0 {
 		return []string{where + ": no deliveries; every route must reach at least one destination"}
@@ -149,7 +159,7 @@ func checkDeliveries(where string, ds []Delivery) []string {
 			hasSlack = true
 		}
 	}
-	if !hasSlack {
+	if requireSlack && !hasSlack {
 		problems = append(problems, where+": does not include slack; a route nobody watches in "+
 			"real time can fail silently")
 	}

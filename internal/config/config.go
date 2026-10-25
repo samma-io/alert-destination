@@ -31,8 +31,32 @@ const (
 	DefaultDaemonMessageTimeout = 60 * time.Second
 )
 
+// Transports. The default is SQS, the AWS deployment.
+const (
+	TransportSQS  = "sqs"
+	TransportNATS = "nats"
+
+	DefaultNATSStream   = "SIEM_ALERTS"
+	DefaultNATSConsumer = "alert-destination"
+)
+
 // Config is the resolved environment.
 type Config struct {
+	// Transport is "sqs" (Lambda or daemon on SQS, DynamoDB ledger, SSM
+	// secrets) or "nats" (daemon on JetStream, Postgres ledger, Kubernetes).
+	Transport string
+
+	// NATS transport only.
+	NATSURL      string
+	NATSStream   string
+	NATSConsumer string
+
+	// PostgresDSN or PostgresDSNFile (a mounted Secret) is the database
+	// holding the ledger and the postgres destination's tables. Required with
+	// the NATS transport.
+	PostgresDSN     string
+	PostgresDSNFile string
+
 	// LedgerTable is the DynamoDB table recording what has been delivered.
 	LedgerTable string
 
@@ -87,6 +111,13 @@ func FromEnv(getenv func(string) string) (Config, error) {
 	get := func(key string) string { return strings.TrimSpace(getenv(key)) }
 
 	cfg := Config{
+		Transport:       get("ALERTDEST_TRANSPORT"),
+		NATSURL:         get("ALERTDEST_NATS_URL"),
+		NATSStream:      get("ALERTDEST_NATS_STREAM"),
+		NATSConsumer:    get("ALERTDEST_NATS_CONSUMER"),
+		PostgresDSN:     get("ALERTDEST_POSTGRES_DSN"),
+		PostgresDSNFile: get("ALERTDEST_POSTGRES_DSN_FILE"),
+
 		LedgerTable:      get("ALERTDEST_LEDGER_TABLE"),
 		SlackTokenParam:  get("ALERTDEST_SLACK_TOKEN_PARAM"),
 		GitHubTokenParam: get("ALERTDEST_GITHUB_TOKEN_PARAM"),
@@ -107,12 +138,42 @@ func FromEnv(getenv func(string) string) (Config, error) {
 		LogLevel: parseLevel(get("ALERTDEST_LOG_LEVEL")),
 	}
 
-	var problems []string
-	for _, required := range []struct{ key, value string }{
-		{"ALERTDEST_LEDGER_TABLE", cfg.LedgerTable},
-		{"ALERTDEST_SLACK_TOKEN_PARAM", cfg.SlackTokenParam},
-		{"ALERTDEST_GITHUB_TOKEN_PARAM", cfg.GitHubTokenParam},
-	} {
+	if cfg.Transport == "" {
+		cfg.Transport = TransportSQS
+	}
+	if cfg.NATSStream == "" {
+		cfg.NATSStream = DefaultNATSStream
+	}
+	if cfg.NATSConsumer == "" {
+		cfg.NATSConsumer = DefaultNATSConsumer
+	}
+
+	var (
+		problems []string
+		required []struct{ key, value string }
+	)
+	switch cfg.Transport {
+	case TransportSQS:
+		required = []struct{ key, value string }{
+			{"ALERTDEST_LEDGER_TABLE", cfg.LedgerTable},
+			{"ALERTDEST_SLACK_TOKEN_PARAM", cfg.SlackTokenParam},
+			{"ALERTDEST_GITHUB_TOKEN_PARAM", cfg.GitHubTokenParam},
+		}
+	case TransportNATS:
+		// Slack and GitHub are optional here: a destination whose token
+		// parameter is unset is not registered, and a routing table that
+		// names it then fails validation at start.
+		required = []struct{ key, value string }{
+			{"ALERTDEST_NATS_URL", cfg.NATSURL},
+		}
+		if cfg.PostgresDSN == "" && cfg.PostgresDSNFile == "" {
+			problems = append(problems, "ALERTDEST_POSTGRES_DSN or ALERTDEST_POSTGRES_DSN_FILE is required with the nats transport")
+		}
+	default:
+		problems = append(problems, fmt.Sprintf("ALERTDEST_TRANSPORT must be %q or %q, got %q",
+			TransportSQS, TransportNATS, cfg.Transport))
+	}
+	for _, required := range required {
 		if required.value == "" {
 			problems = append(problems, required.key+" is required")
 		}

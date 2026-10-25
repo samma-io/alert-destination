@@ -276,3 +276,37 @@ func TestFromEnv_RejectsBadDaemonSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestFromEnv_NATSTransportNeedsNeitherDynamoNorSSM(t *testing.T) {
+	cfg, err := config.FromEnv(env(map[string]string{
+		"ALERTDEST_TRANSPORT":         "nats",
+		"ALERTDEST_NATS_URL":          "nats://nats.samma.svc:4222",
+		"ALERTDEST_POSTGRES_DSN_FILE": "/var/run/secrets/siem-postgres/dsn",
+	}))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.NATSStream != "SIEM_ALERTS" || cfg.NATSConsumer != "alert-destination" {
+		t.Errorf("NATS defaults = %q %q", cfg.NATSStream, cfg.NATSConsumer)
+	}
+}
+
+func TestFromEnv_NATSTransportRequiresURLAndDatabase(t *testing.T) {
+	_, err := config.FromEnv(env(map[string]string{"ALERTDEST_TRANSPORT": "nats"}))
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	for _, want := range []string{"ALERTDEST_NATS_URL", "ALERTDEST_POSTGRES_DSN"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %s, got:\n%v", want, err)
+		}
+	}
+}
+
+func TestFromEnv_RejectsAnUnknownTransport(t *testing.T) {
+	vars := complete()
+	vars["ALERTDEST_TRANSPORT"] = "kafka"
+	if _, err := config.FromEnv(env(vars)); err == nil || !strings.Contains(err.Error(), "ALERTDEST_TRANSPORT") {
+		t.Fatalf("err = %v, want one naming ALERTDEST_TRANSPORT", err)
+	}
+}

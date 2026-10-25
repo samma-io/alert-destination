@@ -18,6 +18,16 @@ jobs:
         image: amazon/dynamodb-local:2.5.2
         ports:
           - 8000:8000
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: alertdest
+          POSTGRES_PASSWORD: alertdest
+          POSTGRES_DB: alertdest
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U alertdest" --health-interval 2s --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

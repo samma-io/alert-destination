@@ -185,6 +185,21 @@ default:
 	}
 }
 
+func TestLoad_PostgresOnlyNeedsAnExplicitOptOut(t *testing.T) {
+	const body = `
+routes:
+  - {level: "*", log_source: "*", deliveries: [{to: postgres, target: siem_alerts}]}
+default:
+  deliveries: [{to: postgres, target: siem_alerts}]
+`
+	if _, err := routing.Load([]byte(body)); err == nil {
+		t.Fatal("Load succeeded for a postgres-only table without require_slack: false")
+	}
+	if _, err := routing.Load([]byte("require_slack: false\n" + body)); err != nil {
+		t.Fatalf("Load with require_slack: false: %v", err)
+	}
+}
+
 func TestLoad_ReportsEveryProblemAtOnce(t *testing.T) {
 	_, err := routing.Load([]byte(`
 routes:
