@@ -114,6 +114,8 @@ error, so a half-wired function refuses to start instead of draining the queue.
 | `ALERTDEST_NATS_CONSUMER` | no | `alert-destination` | Durable pull consumer on that stream. Created by the deployment, not by this service. |
 | `ALERTDEST_POSTGRES_DSN_FILE` | nats, one of | | File holding the Postgres DSN (a mounted Secret). Wins over `ALERTDEST_POSTGRES_DSN`. |
 | `ALERTDEST_POSTGRES_DSN` | nats, one of | | Postgres DSN, for local runs. |
+| `ALERTDEST_SLACK_TOKEN_FILE` | nats, when routed | | File holding the Slack bot token (a key of a mounted Secret). Required when the routing table names `slack`. |
+| `ALERTDEST_GITHUB_TOKEN_FILE` | nats, when routed | | File holding the GitHub fine-grained PAT. Required when the routing table names `github`. |
 | `ALERTDEST_SLACK_BASE_URL` | no | `https://slack.com/api` | Slack API root. Tests only. |
 | `ALERTDEST_GITHUB_BASE_URL` | no | `https://api.github.com` | GitHub API root. GitHub Enterprise or tests. |
 
@@ -358,8 +360,15 @@ With `ALERTDEST_TRANSPORT=nats` the daemon drains a durable pull consumer on the
 - **Schema.** Both tables are created at start (`internal/pgadapt/schema.sql`); the
   statements are additive and idempotent.
 - **Routing table.** It comes from `ALERTDEST_ROUTES_PATH` (a ConfigMap), and only from
-  there. Slack and GitHub are not built in this mode, and a table that names them fails at
-  start. A table without Slack must say `require_slack: false` explicitly.
+  there. A table without Slack must say `require_slack: false` explicitly.
+- **Slack and GitHub.** Built only when the routing table names them, with the same clients,
+  routing and ledger rules as on AWS. Their tokens come from files instead of SSM:
+  `ALERTDEST_SLACK_TOKEN_FILE` and `ALERTDEST_GITHUB_TOKEN_FILE`, normally keys of one
+  Secret mounted as a volume. A routed destination whose variable is unset, or whose file is
+  missing or empty, stops the service at start. The token is read once and cached; an
+  authentication failure drops it and the next delivery re-reads the file, so a rotated
+  Secret is picked up without a restart (mount the whole Secret, not a `subPath`, or the
+  kubelet never refreshes the file). Tokens never appear in logs, errors or the ledger.
 - **Failure handling.** A failed alert is not acked, so the consumer redelivers it after
   `AckWait`. `MaxDeliver` plays the part of the DLQ.
 
@@ -369,6 +378,24 @@ routes:
   - {level: "*", log_source: "*", deliveries: [{to: postgres, target: siem_alerts}]}
 default:
   deliveries: [{to: postgres, target: siem_alerts}]
+```
+
+With Slack and GitHub, mounting a Secret with keys `slack-token` and `github-token` at
+`/var/run/secrets/alert-destination`:
+
+```yaml
+# ALERTDEST_SLACK_TOKEN_FILE=/var/run/secrets/alert-destination/slack-token
+# ALERTDEST_GITHUB_TOKEN_FILE=/var/run/secrets/alert-destination/github-token
+routes:
+  - level: critical
+    log_source: "*"
+    deliveries:
+      - {to: postgres, target: siem_alerts}
+      - {to: slack, target: C0EXAMPLE1}
+      - {to: github, target: example-org/detections}
+  - {level: "*", log_source: "*", deliveries: [{to: postgres, target: siem_alerts}, {to: slack, target: C0EXAMPLE1}]}
+default:
+  deliveries: [{to: postgres, target: siem_alerts}, {to: slack, target: C0EXAMPLE1}]
 ```
 
 ## Data handling
@@ -395,7 +422,7 @@ internal/destination/github/   POST /repos/{owner}/{repo}/issues
 internal/ledger/         what has been delivered where, and why anything failed
 internal/render/         alert -> Slack blocks / GitHub issue, with byte budgets
 internal/httpx/          the retrying transport
-internal/secrets/        SSM reader with a warm-container cache
+internal/secrets/        SSM or mounted-file reader with a warm-container cache
 internal/daemon/         the SQS poll loop for running outside Lambda
 internal/awsadapt/       the only package that imports the AWS SDK
 internal/version/        the build version, set at link time

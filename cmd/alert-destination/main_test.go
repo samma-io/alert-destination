@@ -34,14 +34,28 @@ func (m *memStore) Query(_ context.Context, pk string) ([]ledger.Record, error) 
 	}
 	return out, nil
 }
+
+// PutIfAbsent writes a delivered row; only an existing delivered row stops it,
+// as in the DynamoDB and Postgres stores. A failed row is replaced.
 func (m *memStore) PutIfAbsent(_ context.Context, r ledger.Record) error {
-	if _, ok := m.rows[r.PK+r.SK]; ok {
+	old, ok := m.rows[r.PK+r.SK]
+	if ok && old.Status == ledger.StatusDelivered {
 		return ledger.ErrAlreadyRecorded
+	}
+	if ok {
+		r.Attempts += old.Attempts
+		r.FirstAttemptAt = old.FirstAttemptAt
 	}
 	m.rows[r.PK+r.SK] = r
 	return nil
 }
+
+// Upsert accumulates attempts onto an existing row, as ledger.Store requires.
 func (m *memStore) Upsert(_ context.Context, r ledger.Record) error {
+	if old, ok := m.rows[r.PK+r.SK]; ok {
+		r.Attempts += old.Attempts
+		r.FirstAttemptAt = old.FirstAttemptAt
+	}
 	m.rows[r.PK+r.SK] = r
 	return nil
 }

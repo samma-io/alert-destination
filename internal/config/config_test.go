@@ -291,6 +291,25 @@ func TestFromEnv_NATSTransportNeedsNeitherDynamoNorSSM(t *testing.T) {
 	}
 }
 
+// Token files are paths, read later; whether each is required depends on the
+// routing table, so FromEnv neither demands nor opens them.
+func TestFromEnv_NATSTransportReadsTokenFilePaths(t *testing.T) {
+	cfg, err := config.FromEnv(env(map[string]string{
+		"ALERTDEST_TRANSPORT":         "nats",
+		"ALERTDEST_NATS_URL":          "nats://nats.samma.svc:4222",
+		"ALERTDEST_POSTGRES_DSN_FILE": "/var/run/secrets/siem-postgres/dsn",
+		"ALERTDEST_SLACK_TOKEN_FILE":  " /var/run/secrets/alert-destination/slack-token ",
+		"ALERTDEST_GITHUB_TOKEN_FILE": "/var/run/secrets/alert-destination/github-token",
+	}))
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.SlackTokenFile != "/var/run/secrets/alert-destination/slack-token" ||
+		cfg.GitHubTokenFile != "/var/run/secrets/alert-destination/github-token" {
+		t.Errorf("token files = %q %q", cfg.SlackTokenFile, cfg.GitHubTokenFile)
+	}
+}
+
 func TestFromEnv_NATSTransportRequiresURLAndDatabase(t *testing.T) {
 	_, err := config.FromEnv(env(map[string]string{"ALERTDEST_TRANSPORT": "nats"}))
 	if err == nil {
