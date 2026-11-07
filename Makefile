@@ -15,7 +15,7 @@ PLATFORM ?= linux/amd64
 # The version baked into the binary (and the GitHub User-Agent) is the tag.
 VERSION  ?= $(TAG)
 
-GO_IMAGE   ?= golang:1.25
+GO_IMAGE   ?= golang:1.26
 LINT_IMAGE ?= golangci/golangci-lint:v2.4.0
 # A named volume for the module cache so repeated runs do not re-download.
 DOCKER_GO  := docker run --rm -v "$(CURDIR)":/w -w /w -v alert-destination-gomod:/go/pkg/mod
