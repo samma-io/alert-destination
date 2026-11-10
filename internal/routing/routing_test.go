@@ -108,11 +108,11 @@ func TestResolve_CloudflareIsAKnownLogSource(t *testing.T) {
 	}
 }
 
-// The k8s and scanner lanes exist only on Kubernetes, but they are real lanes
+// The k8s, scanner, wazuh and osquery lanes exist only on Kubernetes, but they are real lanes
 // there, so their alerts must not be counted as coming from somewhere unknown.
 func TestResolve_KubernetesLanesAreKnownLogSources(t *testing.T) {
 	tbl := load(t, valid)
-	for _, src := range []string{"k8s", "scanner"} {
+	for _, src := range []string{"k8s", "scanner", "wazuh", "osquery"} {
 		if _, m := tbl.Resolve("high", src); m.UnknownLogSource {
 			t.Errorf("%s alerts are flagged as an unknown log source", src)
 		}

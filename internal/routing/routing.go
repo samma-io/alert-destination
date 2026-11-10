@@ -45,12 +45,13 @@ var knownLevels = []string{"informational", "low", "medium", "high", "critical"}
 // knownLogSources duplicates the default lane list in aws-siem's Terraform (one
 // SQS lane per log family feeding detection-engine), plus the three lanes that
 // exist only on Kubernetes: k8s (API server audit), scanner (samma scanner
-// findings) and wazuh (Wazuh manager alerts). Duplicated on purpose: this list exists so the totality test can
+// findings), wazuh (Wazuh manager alerts) and osquery (osquery-client results).
+// Duplicated on purpose: this list exists so the totality test can
 // enumerate real inputs, and a lane added there but not here is flagged in
 // metrics rather than by an undelivered alert.
 var knownLogSources = []string{
 	"aws", "github", "dns", "alb", "slack", "onepassword", "workspace", "gcp", "cloudflare",
-	"k8s", "scanner", "wazuh",
+	"k8s", "scanner", "wazuh", "osquery",
 }
 
 // KnownLevels returns the severities the detection plane emits.
