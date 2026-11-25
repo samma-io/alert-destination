@@ -149,8 +149,8 @@ all-wildcard rule. Wildcards are always written `"*"`; a missing field is a vali
 never an implied wildcard. Levels are Sigma's `informational`, `low`, `medium`, `high`,
 `critical`; log sources are the `aws-siem` lane names (`aws`, `github`, `dns`, `alb`, `slack`,
 `onepassword`, `workspace`, `gcp`, `cloudflare`), plus the Kubernetes-only lanes `k8s` (API
-server audit), `scanner` (samma scanner findings), `wazuh` (Wazuh manager alerts) and `osquery`
-(osquery-client results). An unknown level or source is counted in metrics and
+server audit), `scanner` (samma scanner findings), `wazuh` (Wazuh manager alerts), `osquery`
+(osquery-client results) and `traefik` (Traefik access logs via k8s-log-router). An unknown level or source is counted in metrics and
 still delivered; every lookup is total, so no alert can resolve to nowhere.
 
 ```yaml
