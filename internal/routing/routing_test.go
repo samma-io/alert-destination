@@ -112,7 +112,7 @@ func TestResolve_CloudflareIsAKnownLogSource(t *testing.T) {
 // there, so their alerts must not be counted as coming from somewhere unknown.
 func TestResolve_KubernetesLanesAreKnownLogSources(t *testing.T) {
 	tbl := load(t, valid)
-	for _, src := range []string{"k8s", "scanner", "wazuh", "osquery", "traefik"} {
+	for _, src := range []string{"k8s", "scanner", "wazuh", "osquery", "traefik", "keycloak"} {
 		if _, m := tbl.Resolve("high", src); m.UnknownLogSource {
 			t.Errorf("%s alerts are flagged as an unknown log source", src)
 		}
