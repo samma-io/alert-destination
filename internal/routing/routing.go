@@ -47,13 +47,16 @@ var knownLevels = []string{"informational", "low", "medium", "high", "critical"}
 // exist only on Kubernetes: k8s (API server audit), scanner (samma scanner
 // findings), wazuh (Wazuh manager alerts), osquery (osquery-client results), traefik
 // (Traefik access logs from labelled pods, via k8s-log-router) and keycloak
-// (Keycloak user events from labelled pods, via k8s-log-router).
+// (Keycloak user events from labelled pods, via k8s-log-router), and the
+// security tools on the same router: falco, gatekeeper and openappsec (pod
+// logs) and trivy (trivy-operator reports pushed over HTTP).
 // Duplicated on purpose: this list exists so the totality test can
 // enumerate real inputs, and a lane added there but not here is flagged in
 // metrics rather than by an undelivered alert.
 var knownLogSources = []string{
 	"aws", "github", "dns", "alb", "slack", "onepassword", "workspace", "gcp", "cloudflare",
 	"k8s", "scanner", "wazuh", "osquery", "traefik", "keycloak",
+	"falco", "trivy", "gatekeeper", "openappsec",
 }
 
 // KnownLevels returns the severities the detection plane emits.
